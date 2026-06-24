@@ -1,0 +1,57 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.env
+market.db
+market_enriched.csv
+data/
+logs/
+.DS_Store
+.idea/
+.vscode/
+node_modules/
+dist/
+*.log
+*.sqlite
+pytdx3/
+stock_industry_base.csv
+stock_list_a.csv
+coverage_report.csv
+portfolio_suggestion.csv
+l2_*.csv
+offenders_*.csv
+ts_sample_*.csv
+build_log.txt
+*.epub
+~$*
+
+# SQLite WAL/SHM 临时文件
+market.db-shm
+market.db-wal
+
+# config/ 分析输出 CSV（打分脚本产物，非版本化文件）
+config/*.csv
+
+# config/ 备份与中间产物 YAML
+config/scoring.yaml.bak
+config/scoring_l1_primary*.yaml
+config/scoring_merged.yaml
+
+# Claude 会话续传临时文件
+*.session-continuation*.txt
+[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-*.txt
+
+# 根目录误生成的 package-lock.json（前端 lock 应在 web/frontend/ 下）
+/package-lock.json
+
+# 测试产物
+test-results/
+.gstack/
+*.db
+*.db-shm
+*.db-wal

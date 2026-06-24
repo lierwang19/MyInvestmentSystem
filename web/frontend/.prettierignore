@@ -1,0 +1,4 @@
+# Prettier 不处理以下文件/目录
+node_modules
+dist
+*.md

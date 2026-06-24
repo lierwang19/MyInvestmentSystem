@@ -1,0 +1,80 @@
+/* 共享样式：供所有 settings 子页面的 :deep() 使用 */
+
+.settings-section {
+    background: var(--card-bg, #1a1a1a);
+    border-radius: 12px;
+    padding: 22px 24px;
+    margin-bottom: 16px;
+    border: 1px solid var(--border-color);
+}
+
+.settings-section h3 {
+    margin: 0 0 14px 0;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+.section-desc {
+    color: var(--text-secondary);
+    font-size: 13px;
+    margin-bottom: 20px;
+}
+
+.section-desc code {
+    background: rgba(255,255,255,0.1);
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.settings-form {
+    max-width: 500px;
+}
+
+.form-hint {
+    margin-left: 12px;
+    color: var(--text-secondary);
+    font-size: 12px;
+}
+
+.data-actions {
+    display: flex;
+    gap: 20px;
+}
+
+.action-item {
+    flex: 1;
+    background: rgba(255,255,255,0.03);
+    padding: 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    transition: background 0.15s;
+}
+
+.action-item:hover {
+    background: rgba(255,255,255,0.05);
+}
+
+[data-theme="light"] .action-item {
+    background: rgba(0,0,0,0.02);
+}
+
+[data-theme="light"] .action-item:hover {
+    background: rgba(0,0,0,0.04);
+}
+
+.action-item h4 {
+    margin: 0 0 10px 0;
+    font-size: 14px;
+}
+
+.action-item p {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 15px;
+    height: 32px;
+}
+
+.warning-text {
+    color: #f56c6c !important;
+}

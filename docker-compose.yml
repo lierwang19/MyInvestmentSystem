@@ -1,0 +1,40 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: web/backend/Dockerfile
+    container_name: invest_backend
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./market.db:/app/market.db
+      - ./stock_industry_base.csv:/app/stock_industry_base.csv
+      - ./market_enriched.csv:/app/market_enriched.csv
+      - ./user_data.db:/app/user_data.db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN:-}
+      - ts_token=${ts_token:-}
+      - SINGLE_USER_MODE=${SINGLE_USER_MODE:-}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - TZ=${TZ:-Asia/Shanghai}
+      - OLLAMA_HOST=host.docker.internal
+    dns:
+      - 114.114.114.114
+      - 223.5.5.5
+    restart: always
+
+  frontend:
+    build:
+      context: .
+      dockerfile: web/frontend/Dockerfile
+    container_name: invest_frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: always

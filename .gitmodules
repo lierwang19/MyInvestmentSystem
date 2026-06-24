@@ -1,0 +1,3 @@
+[submodule "pytdx3"]
+	path = pytdx3
+	url = https://github.com/lierwang19/pytdx3.git

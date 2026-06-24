@@ -1,0 +1,68 @@
+# ============================================================
+# 大数投资策略配置 — dashu_v1
+# ============================================================
+# 此文件存放买卖规则参数,与打分配置 scoring.yaml 分离。
+# 修改此文件直接影响策略输出的买卖建议。
+
+strategy:
+  id: dashu_v1
+  name: 大数投资
+  type: value_accumulation
+  description: >
+    基于PB/PE低估值的组合投资策略。
+    持有30+只股票,每行业资金≤3%,总仓位≤2/3。
+    分批建仓,从一年低点计算减仓。
+
+# ── 买入规则 ──
+buy_rules:
+  # 入场条件
+  entry:
+    max_pb: 2.0                    # PB < 2.0 才可买入
+    max_pe: 20.0                   # PE < 20 才可买入
+    market_pb_halt: 2.5            # 全市场PB > 此值暂停所有买入
+
+  # 分批建仓 (绝对胜算模型)
+  batch:
+    high_pb_threshold: 1.5         # PB > 此值视为"偏高入场"
+    high_pb_drop_pct: 20           # 偏高入场: 每下跌20%加仓
+    low_pb_drop_pct: 10            # 偏低入场: 每下跌10%加仓
+
+  # 仓位上限
+  position_limits:
+    max_industry_pct: 3.0          # 每行业占总资产上限 3%
+    max_total_position_pct: 66.7   # 总持仓市值 ≤ 总资金的 2/3
+    min_portfolio_count: 30        # 最低组合持股数 30
+
+# ── 卖出规则 ──
+sell_rules:
+  # 卖出方法: from_1y_low / from_buy_pb
+  method: from_1y_low
+
+  # 方案一: 从过去一年最低点计算涨幅
+  from_1y_low:
+    thresholds:
+      - rise_pct: 100              # 从一年低点涨100% → 减半卖出
+        sell_ratio: 0.5
+      - rise_pct: 200              # 继续涨到200% → 再减半卖出
+        sell_ratio: 0.5
+      - rise_pct: 400              # 继续涨到400% → 再减半卖出
+        sell_ratio: 0.5
+
+  # 方案二(备用): 按买入时的PB估值
+  from_buy_pb:
+    thresholds:
+      - buy_pb_max: 2.0            # PB 2.0倍买入 → 涨50%减半
+        rise_pct: 50
+        sell_ratio: 0.5
+      - buy_pb_max: 1.5            # PB 1.5倍买入 → 涨75%减半
+        rise_pct: 75
+        sell_ratio: 0.5
+      - buy_pb_max: 1.0            # PB 1.0倍买入 → 涨100%减半
+        rise_pct: 100
+        sell_ratio: 0.5
+
+# ── 其他规则 ──
+other_rules:
+  no_stop_loss: true               # 不止损: 估值合理就继续持有
+  no_chase_rise: true              # 不追涨: 只在下跌中买入
+  reinvest_sell_proceeds: true     # 卖出资金立即用于配置其他低估行业

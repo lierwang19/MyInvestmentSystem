@@ -1,0 +1,202 @@
+OK！我把“从零到可用”的整套流程梳理成一份可执行的SOP，涵盖脚本作用、运行顺序、常见参数、推荐命令、核查与补救闭环。你可以直接按顺序跑。
+
+# 一、环境与准备
+
+1 Python环境
+建议使用你现有的 investment_env。必要依赖：akshare、pandas、tushare（用于上市日&回灌&校验）、可选 baostock（兜底）。
+
+2 安装与Token
+pip install -U akshare pandas tushare
+可选：pip install -U baostock
+PowerShell 设置 TuShare Token：
+$env:TUSHARE_TOKEN="你的token"
+
+3 目录关键文件
+tdx_export.xlsx（通达信行业导出）
+config/scoring.yaml（打分配置&锚点）
+stock_industry_base.csv（本流程生成）
+market.db（SQLite行情与后续因子库）
+logs/（所有失败与核查日志）
+
+# 二、行业基础表生成（含二级行业与锚点）
+
+脚本：process_tdx_industry_v3.py
+输入：tdx_export.xlsx、config/scoring.yaml
+输出：stock_industry_base.csv（列：ts_code、name、tdx_l1、tdx_l2、anchor_industry…）
+示例命令
+python process_tdx_industry_v3.py --tdx-xlsx tdx_export.xlsx --yaml config/scoring.yaml --out stock_industry_base.csv
+
+核对重点
+1 是否出现 .BJ 标的，如出现后续抓数会自动跳过
+2 是否包含 tdx_l2 和 anchor_industry
+
+# 三、历史行情入库（多源兜底，稳健增量）
+
+脚本：get_market_data_db_robust.py
+作用：建库表 daily_price、daily_snapshot；按 腾讯→新浪→（可选）Baostock→东财 顺序兜底；增量更新；可跳过快照；导出近一年低点口径 market_enriched.csv
+常用参数开关（若写在脚本内的默认即可忽略）
+SKIP_SPOT=True 建议先跳过快照
+可启用 TuShare 开关版本（你已合并）以提高成功率
+推荐首次全量命令
+python get_market_data_db_robust.py
+
+看到输出“完成：market_enriched.csv”和 logs/failed_hist.csv 即说明流程跑完。失败清单存在是正常的。
+
+# 四、覆盖度核查与闭环修复
+
+目标：确保每个沪深A股，从上市日IPO开始的历史行情都写入 DB，尾部也对齐到目标交易日。
+
+4.1 覆盖度核查
+脚本：check_coverage.py（已支持 end-target=prev|today|date）
+依赖：设置 TUSHARE_TOKEN 且 --use-tushare 1 才会做“起始覆盖”校验
+推荐白天核查（用上一交易日作为目标，避免把“今天未收盘”当缺口）
+$env:TUSHARE_TOKEN="你的token"
+python check_coverage.py --db market.db --base stock_industry_base.csv --skip-bj 1 --allow-start-gap 5 --allow-end-gap 1 --use-tushare 1 --end-target prev
+输出文件
+coverage_report.csv（总览）
+offenders_start_gap_top30.csv（起始缺口Top30）
+offenders_end_gap_top30.csv（尾部缺口Top30）
+offenders_zero_rows.csv（零行清单）
+
+4.2 从IPO日回灌起始段
+脚本：backfill_from_ipo.py（支持分片 chunk-days、no-proxy、max-retry；最新版已加 --end-target 同步风格，如果你本地未更新，我可以发补丁）
+典型命令（高成功率组合）
+$args = @(
+"--db","market.db",
+"--base","stock_industry_base.csv",
+"--allow-start-gap","5",
+"--sleep","0.12",
+"--max-retry","8",
+"--no-proxy","1",
+"--chunk-days","5500"
+)
+python backfill_from_ipo.py @args
+说明
+no-proxy=1 会显式屏蔽本地代理环境变量
+chunk-days 约等于一次6000行，兼容老股全历史
+max-retry 建议≥6
+回灌结果会打印“backfilled xxxx rows (chunked)”并写入 logs/backfill_start_needed.csv、logs/backfill_start_failed.csv
+
+4.3 困难样本补救
+方案A：rescue_backfill_failed.py（从失败清单逐只再试，ak顺序）
+python rescue_backfill_failed.py --db market.db --failed logs/backfill_start_failed.csv --sleep 0.8 --order tx,sina,em
+
+方案B：quick_check_listdate.py + 指定代码深挖
+python quick_check_listdate.py --db market.db
+python rescue_backfill_failed_v2.py --db market.db --codes 600653.SH,600604.SH,600606.SH,600608.SH --ak-order tx,sina,em --ak-adjusts qfq,hfq,none --use-ts 1 --sleep 0.8
+
+4.4 再核查
+python check_coverage.py --db market.db --base stock_industry_base.csv --skip-bj 1 --allow-start-gap 5 --allow-end-gap 1 --use-tushare 1 --end-target prev
+目标口径
+Start-gap pass ≥ 99.5%（≤5个交易日）
+End-gap pass ≈ 100%（≤1个交易日）
+
+# 五、财报因子与估值口径（推导 PB/PE_TTM）
+
+脚本：build_fundamentals_and_valuation.py
+作用：抓取并/或整合如下核心口径，计算可日频对齐的估值指标
+BVPS（每股净资产）
+EPS_TTM（滚动每股收益）
+派生 PB=close/BVPS，PE_TTM=close/EPS_TTM
+处理原则：公告日对齐→向前填充→以收盘价推导
+推荐命令
+python build_fundamentals_and_valuation.py --ts-file ts_sample_20.csv --batch 0 --start-year 2015 --sleep 0.5
+输出
+market_enriched.csv（含 latest、pb、pe_ttm、252低点等；后续打分读取）
+logs/failed_factors.csv（抓取/推导失败清单）
+提示
+若失败数偏多，直接重复运行；网络波动常见。也可以按失败清单专门重试。
+
+# 六、风险标记与打分
+
+6.1 风险标记 risk_flags
+数据来源
+ok_debt：资产负债率 vs 行业中位数（需资产负债表）
+ok_goodwill_intangibles：商誉+无形资产占比（需资产负债表）
+ok_controller_pledge：大股东质押率（手工或CSV导入到 shareholder_pledge）
+has_major_event：重大事项人工标注（risk_manual 表）
+流程
+etl_financials.py 计算并写入中间表，再汇总生成 risk_flags
+
+6.2 三正打分（分桶=按锚点自动生成）
+配置：config/scoring.yaml（已把“台阶算法”改为“按锚点自动分桶”，并支持“特殊行业阈值宽容度”）
+执行：scoring.py 或整合在 rank_candidates.py
+输入：market_enriched.csv、risk_flags、scoring.yaml
+输出：scores_raw（SQLite 表）
+思路：
+三正打分是基础约束；三负与“一重大”为可选过滤开关（前端/接口层做动态开关，而不是在入库时直接剔除）
+
+6.3 汇总视图
+view_candidates：联结 stock_industry_base、scores_raw、risk_flags，便于接口/页面直接查询
+
+# 七、日常增量SOP（T+0/夜间或T+1早晨）
+
+顺序如下
+1 增量行情入库
+python get_market_data_db_robust.py
+2 覆盖度核查（尾段用 end-target=today 或 prev）
+python check_coverage.py --db market.db --base stock_industry_base.csv --skip-bj 1 --allow-start-gap 5 --allow-end-gap 1 --use-tushare 1 --end-target prev
+3 必要时小规模回灌/补救
+backfill_from_ipo.py / rescue_backfill_failed.py
+4 财报因子与估值推导
+python build_fundamentals_and_valuation.py --start-year 2015
+5 打分
+python scoring.py（或 rank_candidates.py）
+6 导出/接口/前端刷新
+
+# 八、数据库即时自检与定位
+
+1 DB Browser 看到 market.db-wal 频繁变化但 market.db 时间未动，是正常的（WAL模式）。结束进程或VACUUM后会合并进主库。
+2 快速查一票是否已覆盖
+sqlite3 market.db
+SELECT MIN(trade_date),MAX(trade_date),COUNT(*) FROM daily_price WHERE ts_code='600000.SH';
+3 市场覆盖概览（DB端聚合）
+SELECT COUNT(DISTINCT ts_code) AS n_codes, MIN(trade_date), MAX(trade_date), COUNT(*) AS n_rows FROM daily_price;
+4 快捷脚本
+verify_price_coverage.py 与 check_coverage.py 功能类似；建议统一用 check_coverage.py（交易日口径更严谨，支持 end-target）。
+
+# 九、logs 目录说明
+
+failed_hist.csv 历史日线抓取失败清单（get_market_data_db_robust.py）
+failed_spot.csv 快照聚合失败清单（如启用快照）
+backfill_start_needed.csv 起始回灌需要清单
+backfill_start_failed.csv 起始回灌失败清单
+failed_factors.csv 财报/因子抓取与推导失败
+coverage_report.csv 等核查产物会在当前目录导出
+
+# 十、常用命令备忘
+
+生成行业底表
+python process_tdx_industry_v3.py --tdx-xlsx tdx_export.xlsx --yaml config/scoring.yaml --out stock_industry_base.csv
+
+全量/增量抓历史（日线，多源兜底）
+python get_market_data_db_robust.py
+
+覆盖度核查（强烈推荐白天用 prev）
+python check_coverage.py --db market.db --base stock_industry_base.csv --skip-bj 1 --allow-start-gap 5 --allow-end-gap 1 --use-tushare 1 --end-target prev
+
+从IPO回灌（最新版支持 --end-target，一般无需设置）
+$args = @("--db","market.db","--base","stock_industry_base.csv","--allow-start-gap","5","--sleep","0.12","--max-retry","8","--no-proxy","1","--chunk-days","5500")
+python backfill_from_ipo.py @args
+
+救火（针对失败清单）
+python rescue_backfill_failed.py --db market.db --failed logs/backfill_start_failed.csv --sleep 0.8 --order tx,sina,em
+
+财报因子与估值推导
+python build_fundamentals_and_valuation.py --start-year 2015
+
+打分
+python scoring.py
+
+# 十一、你可能会关心的细节与阈值建议
+
+1 check_coverage 起始缺口阈值
+allow-start-gap=5（按交易日）已足够严
+2 尾部缺口阈值
+allow-end-gap=1；白天跑建议 --end-target prev
+3 TuShare频控
+你是付费账号，额度充裕。回灌建议 sleep 0.12~0.20，chunk-days≈5500，max-retry≥6，并开启 --no-proxy 以减少代理干扰。
+4 特殊老股的IPO前缺口
+个别极老券在第三方源可能无法补齐更早段，保留在 offenders_start_gap_top30.csv 单独看待。不影响整体口径。
+
+需要我把 backfill_from_ipo.py 的“end-target”版补丁也直接发你么？如果你希望一并更新，我就把完整文件贴出来，与你本地版本对齐。
