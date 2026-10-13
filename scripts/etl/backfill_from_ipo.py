@@ -415,9 +415,28 @@ def upsert_daily_price(conn: sqlite3.Connection, ts_code: str, df_qfq: pd.DataFr
 
 
 # --------------------- 主流程 ---------------------
+def _default_db_path():
+    """data/market.db 优先；兼容项目根目录下的旧文件。"""
+    try:
+        from web.backend.config import resolve_db_path
+        return resolve_db_path("market.db")
+    except ImportError:
+        pass
+    # 独立运行、无法导入 web.backend 时：按脚本位置定位项目根目录，
+    # 用绝对路径并确保 data/ 存在，避免 CWD 相关的相对路径打不开库。
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(root, "data")
+    new_path = os.path.join(data_dir, "market.db")
+    old_path = os.path.join(root, "market.db")
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        os.makedirs(data_dir, exist_ok=True)
+        return new_path
+    return old_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="从 IPO 日回灌起始缺口（TuShare 为主，支持 end-target）")
-    parser.add_argument("--db", type=str, default="market.db", help="SQLite 数据库路径")
+    parser.add_argument("--db", type=str, default=_default_db_path(), help="SQLite 数据库路径")
     parser.add_argument("--base", type=str, default="stock_industry_base.csv", help="基础表 CSV（含 ts_code）")
     parser.add_argument("--allow-start-gap", type=int, default=5, help="允许起始缺口的最大交易日数（≤该值视为无需回灌）")
     parser.add_argument("--sleep", type=float, default=0.15, help="每只票抓取后的休眠秒数")

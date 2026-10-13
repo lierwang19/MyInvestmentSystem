@@ -61,19 +61,20 @@ def main():
 
     freq = miss.value_counts().reset_index()
     freq.columns = ["tdx_l2", "count"]
-    freq.to_csv("l2_not_hit_freq.csv", index=False, encoding="utf-8-sig")
+    Path("data").mkdir(parents=True, exist_ok=True)
+    freq.to_csv("data/l2_not_hit_freq.csv", index=False, encoding="utf-8-sig")
 
     # 生成别名草案（右侧先自映射，便于你手动替换为目标锚点）
     alias_map = {k: k for k in freq["tdx_l2"].head(args.top)}
     out_yaml = {"l2_aliases": alias_map}
-    Path("l2_aliases_suggest.yaml").write_text(
+    Path("data/l2_aliases_suggest.yaml").write_text(
         yaml.safe_dump(out_yaml, allow_unicode=True, sort_keys=False),
         encoding="utf-8"
     )
 
     print("已导出：")
-    print("- l2_not_hit_freq.csv")
-    print("- l2_aliases_suggest.yaml   （请把右侧的自映射改为你想归一到的锚点名）")
+    print("- data/l2_not_hit_freq.csv")
+    print("- data/l2_aliases_suggest.yaml   （请把右侧的自映射改为你想归一到的锚点名）")
 
 if __name__ == "__main__":
     main()

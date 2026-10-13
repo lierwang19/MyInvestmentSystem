@@ -22,10 +22,29 @@ def get_tail_from_db(conn: sqlite3.Connection, ts_code: str, n: int) -> pd.DataF
         return df
     return df # Note: DESC order in query, so iloc[0] is latest, iloc[-1] is oldest
 
+def _default_db_path():
+    """data/market.db 优先；兼容项目根目录下的旧文件。"""
+    try:
+        from web.backend.config import resolve_db_path
+        return resolve_db_path("market.db")
+    except ImportError:
+        pass
+    # 独立运行、无法导入 web.backend 时：按脚本位置定位项目根目录，
+    # 用绝对路径并确保 data/ 存在，避免 CWD 相关的相对路径打不开库。
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(root, "data")
+    new_path = os.path.join(data_dir, "market.db")
+    old_path = os.path.join(root, "market.db")
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        os.makedirs(data_dir, exist_ok=True)
+        return new_path
+    return old_path
+
+
 def patch():
     base_file = "market_enriched.csv"
-    db_path = "market.db"
-    
+    db_path = _default_db_path()
+
     if not os.path.exists(base_file) or not os.path.exists(db_path):
         print("Missing files.")
         return

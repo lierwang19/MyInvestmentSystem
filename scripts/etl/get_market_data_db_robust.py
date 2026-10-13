@@ -70,7 +70,24 @@ except ModuleNotFoundError:
 
 # ===================== 默认配置（可被命令行覆盖） =====================
 DEFAULT_BASE_FILE   = "stock_industry_base.csv"
-DEFAULT_DB_PATH     = "market.db"
+def _default_db_path():
+    """data/market.db 优先；兼容项目根目录下的旧文件。"""
+    try:
+        from web.backend.config import resolve_db_path
+        return resolve_db_path("market.db")
+    except ImportError:
+        pass
+    # 独立运行、无法导入 web.backend 时：按脚本位置定位项目根目录，
+    # 用绝对路径并确保 data/ 存在，避免 CWD 相关的相对路径打不开库。
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(root, "data")
+    new_path = os.path.join(data_dir, "market.db")
+    old_path = os.path.join(root, "market.db")
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        os.makedirs(data_dir, exist_ok=True)
+        return new_path
+    return old_path
+DEFAULT_DB_PATH     = _default_db_path()
 DEFAULT_OUT_FILE    = "market_enriched.csv"
 
 DEFAULT_SKIP_SPOT   = True

@@ -8,7 +8,7 @@ import numpy as np
 from copy import deepcopy
 
 # Add project root to sys.path
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH, USER_DB_PATH
 
 try:
     import build_portfolio
@@ -52,6 +52,15 @@ def _safe_mtime(path: str):
         return None
 
 
+def _db_cache_mtime(path: str):
+    """数据库缓存键用的时间戳。
+
+    WAL 模式下事务提交可能只追加 -wal，主库文件 mtime 不变；
+    把 -wal/-shm 的 mtime 一并取最大，避免缓存长期不失效。
+    """
+    return max((_safe_mtime(p) or 0) for p in (path, path + "-wal", path + "-shm"))
+
+
 def _get_latest_holdings_file_mtime(account_id: str):
     acc_dir = os.path.join(UPLOAD_DIR, "holdings", account_id)
     if not os.path.isdir(acc_dir):
@@ -68,8 +77,8 @@ def _get_latest_holdings_file_mtime(account_id: str):
 def _get_holdings_cache_key(account_id: str):
     return (
         account_id,
-        _safe_mtime(os.path.join(PROJECT_ROOT, "user_data.db")),
-        _safe_mtime(os.path.join(PROJECT_ROOT, "market.db")),
+        _db_cache_mtime(USER_DB_PATH),
+        _db_cache_mtime(MARKET_DB_PATH),
         _safe_mtime(os.path.join(PROJECT_ROOT, "config", "scoring.yaml")),
         _safe_mtime(os.path.join(PROJECT_ROOT, "stock_industry_base.csv")),
         _get_latest_holdings_file_mtime(account_id),
@@ -274,11 +283,16 @@ def _load_market_data_from_db(ts_codes: list) -> pd.DataFrame:
             try:
                 rows = conn.execute(f"""
                     WITH latest_dv AS (
-                        SELECT ts_code, pb, pe_ttm, trade_date
-                        FROM daily_valuation
-                        WHERE ts_code IN ({placeholders})
-                        GROUP BY ts_code
-                        HAVING trade_date = MAX(trade_date)
+                        -- 每只股票取 trade_date 最大的那一行（原 GROUP BY + HAVING 写法
+                        -- 在 SQLite 中对 bare column 取值未定义，不保证拿到最新行）
+                        SELECT dv.ts_code, dv.pb, dv.pe_ttm, dv.trade_date
+                        FROM daily_valuation dv
+                        INNER JOIN (
+                            SELECT ts_code, MAX(trade_date) AS max_date
+                            FROM daily_valuation
+                            WHERE ts_code IN ({placeholders})
+                            GROUP BY ts_code
+                        ) m ON dv.ts_code = m.ts_code AND dv.trade_date = m.max_date
                     )
                     SELECT lv.ts_code, lv.pb, lv.pe_ttm, lv.trade_date, dp.close AS val_close
                     FROM latest_dv lv

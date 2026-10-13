@@ -8,6 +8,7 @@
 """
 import io
 import logging
+from contextlib import contextmanager
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -1807,6 +1808,23 @@ async def import_flow(
     }
 
 
+@contextmanager
+def _savepoint(conn, name="sp_rebuild"):
+    """SQLite SAVEPOINT 上下文管理器。
+
+    使用固定 savepoint 名（无 f-string 拼接，避免标识符注入面）；
+    异常时 ROLLBACK TO，保证 RELEASE 一定执行，savepoint 栈不泄漏。
+    """
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        yield
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+        raise
+    finally:
+        conn.execute(f"RELEASE SAVEPOINT {name}")
+
+
 @router.post("/import/rebuild-all-holdings")
 async def rebuild_all_holdings():
     """对所有账户重跑 _rebuild_holdings，修复持仓成本价。
@@ -1816,23 +1834,14 @@ async def rebuild_all_holdings():
     with get_db() as conn:
         account_ids = [row["id"] for row in conn.execute("SELECT id FROM accounts").fetchall()]
         for aid in account_ids:
-            sp = f"sp_rebuild_{aid.replace('-', '_')}"
-            conn.execute(f"SAVEPOINT {sp}")
-            released = False
             try:
-                skipped = _rebuild_holdings(aid, conn)
+                with _savepoint(conn):
+                    skipped = _rebuild_holdings(aid, conn)
             except Exception as e:
+                # 回滚本账户的改动，继续处理下一个账户
                 errors[aid] = str(e)
-                try:
-                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                finally:
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
-                    released = True
             else:
                 results[aid] = {"skipped_sells": len(skipped)}
-            finally:
-                if not released:
-                    conn.execute(f"RELEASE SAVEPOINT {sp}")
         conn.commit()
     return {
         "status": "ok" if not errors else "partial",

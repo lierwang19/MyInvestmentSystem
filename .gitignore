@@ -6,6 +6,11 @@ __pycache__/
 env/
 venv/
 .venv/
+.test-env/
+.pytest_cache/
+.coverage
+htmlcov/
+web/frontend/coverage/
 .env
 market.db
 market_enriched.csv
@@ -55,3 +60,6 @@ test-results/
 *.db
 *.db-shm
 *.db-wal
+
+# onnxruntime 导入时生成的运行时副产物
+/:memory:.ses

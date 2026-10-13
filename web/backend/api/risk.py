@@ -8,7 +8,7 @@ import os
 import threading
 import logging
 
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, USER_DB_PATH
 from web.backend.database import get_db
 from web.backend.utils import dict_factory
 
@@ -155,7 +155,7 @@ def scan_risk_flags(
     effective_source = source or ("offline" if skip_online else "akshare")
 
     base_path    = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
-    user_db_path = os.path.join(PROJECT_ROOT, "user_data.db")
+    user_db_path = USER_DB_PATH
 
     if not os.path.exists(base_path):
         raise HTTPException(status_code=400, detail="stock_industry_base.csv not found.")

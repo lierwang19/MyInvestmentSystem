@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
 from web.backend.time_utils import sh_date_str, sh_timestamp_str
+from web.backend.config import resolve_db_path
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -230,8 +231,9 @@ def generate_signals(
                         holding_pb = stored_buy_pb
                     else:
                         holding_pb = pb  # 回退：历史持仓未记录 buy_pb
+                        pb_text = f"{pb:.2f}" if pb is not None else "缺失"
                         logger.warning(
-                            f"{ts_code}: buy_pb 未记录，用当前 PB={pb:.2f} 近似分桶（建议补录首买 PB）"
+                            f"{ts_code}: buy_pb 未记录，用当前 PB={pb_text} 近似分桶（建议补录首买 PB）"
                         )
                     for th in sorted(sell_thresholds, key=lambda t: float(t.get("buy_pb_max", 99))):
                         if holding_pb is not None and holding_pb <= float(th.get("buy_pb_max", 99)):
@@ -742,8 +744,9 @@ def run_strategy(
 
     result = StrategyRunResult(strategy_id=strategy_id, run_date=run_date)
 
-    user_db_path = os.path.join(project_root, "user_data.db")
-    market_db_path = os.path.join(project_root, "market.db")
+    # DB 统一走 <project_root>/data/，兼容旧的根目录位置
+    user_db_path = resolve_db_path("user_data.db", project_root)
+    market_db_path = resolve_db_path("market.db", project_root)
 
     try:
         # 1. Load strategy config

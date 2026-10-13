@@ -15,6 +15,7 @@ scoring.py — 统一打分入口
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sqlite3
 from pathlib import Path
@@ -22,6 +23,14 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import pandas as pd
 import yaml
+
+def _resolve_user_db(root):
+    """data/user_data.db 优先；兼容给定 root 下的旧位置。"""
+    new = os.path.join(root, "data", "user_data.db")
+    if os.path.exists(new):
+        return new
+    old = os.path.join(root, "user_data.db")
+    return old if os.path.exists(old) else new
 
 try:
     from web.backend.time_utils import sh_timestamp_str
@@ -37,6 +46,12 @@ except ImportError:
 def load_yaml(path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _valid_score(x) -> bool:
+    """分项分数是否可参与加权：None / NaN / Inf 均视为缺失。"""
+    v = to_float(x)
+    return v is not None and math.isfinite(v)
 
 
 def to_float(x) -> Optional[float]:
@@ -175,7 +190,7 @@ def run_scoring(
     if enriched_path is None:
         enriched_path = str(cfg_dir_for_defaults / "market_enriched.csv")
     if user_db_path is None:
-        user_db_path = os.path.join(project_root, "user_data.db")
+        user_db_path = _resolve_user_db(project_root)
 
     cfg = load_yaml(config_path)
     cfg_dir = Path(config_path).resolve().parent
@@ -265,11 +280,11 @@ def run_scoring(
     total_scores = []
     for _, row in df.iterrows():
         parts = []
-        if row["pb_score"] is not None:
+        if _valid_score(row["pb_score"]):
             parts.append((w_pb, row["pb_score"]))
-        if row["pe_score"] is not None:
+        if _valid_score(row["pe_score"]):
             parts.append((w_pe, row["pe_score"]))
-        if row["dist_score"] is not None:
+        if _valid_score(row["dist_score"]):
             parts.append((w_dist, row["dist_score"]))
 
         if not parts:

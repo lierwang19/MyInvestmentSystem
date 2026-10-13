@@ -30,8 +30,13 @@ except ImportError:
         return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
     def sh_today() -> date:
         return datetime.now(ZoneInfo("Asia/Shanghai")).date()
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-USER_DB = os.path.join(PROJECT_ROOT, "user_data.db")
+try:
+    from web.backend.config import USER_DB_PATH as USER_DB  # data/ 统一路径，含旧位置兼容
+except ImportError:
+    _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _new = os.path.join(_ROOT, "data", "user_data.db")
+    _old = os.path.join(_ROOT, "user_data.db")
+    USER_DB = _new if os.path.exists(_new) or not os.path.exists(_old) else _old
 
 for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
     os.environ.pop(k, None)

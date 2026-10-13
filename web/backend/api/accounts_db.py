@@ -8,12 +8,14 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Iterable
 import logging
+import math
 import os
 import shutil
 
 from web.backend.database import get_db, get_market_db
 from web.backend.config import PROJECT_ROOT
 from web.backend.time_utils import sh_timestamp_str
+from web.backend.utils import is_iso_date
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -83,6 +85,13 @@ def _calc_holdings_market_values(account_ids: Optional[Iterable[str]] = None) ->
 def _calc_holdings_market_value(account_id: str) -> float:
     """兼容单账户调用。"""
     return _calc_holdings_market_values([account_id]).get(account_id, 0.0)
+
+
+def _apply_capital_flow_cash(c, account_id: str, flow_type: str, amount: float):
+    """按资金流水增减现金余额；amount 为负表示冲销。"""
+    delta = amount if flow_type == "DEPOSIT" else -amount
+    c.execute("UPDATE accounts SET cash_balance = COALESCE(cash_balance, 0) + ? WHERE id = ?",
+              (delta, account_id))
 
 
 def _rebuild_account_state(conn, account_id: str):
@@ -300,6 +309,10 @@ def add_capital_flow(account_id: str, flow: CapitalFlowCreate):
     """添加资金流水记录"""
     if flow.flow_type not in ["DEPOSIT", "WITHDRAW"]:
         raise HTTPException(status_code=400, detail="Invalid flow_type. Must be DEPOSIT or WITHDRAW")
+    if not math.isfinite(flow.amount) or flow.amount <= 0:
+        raise HTTPException(status_code=400, detail="金额必须是大于 0 的有限数值")
+    if not is_iso_date(flow.date):
+        raise HTTPException(status_code=400, detail="日期格式必须为补零的 YYYY-MM-DD")
     created_at = sh_timestamp_str()
     
     with get_db() as conn:
@@ -314,8 +327,8 @@ def add_capital_flow(account_id: str, flow: CapitalFlowCreate):
             VALUES (?, ?, ?, ?, ?, ?)
         ''', (account_id, flow.flow_type, flow.amount, flow.date, flow.remarks, created_at))
         flow_id = c.lastrowid
-        # 完整重放资金流水+交易，确保现金/持仓一致性
-        _rebuild_account_state(conn, account_id)
+        # 资金流水只影响现金：增量调整，不重放持仓（快照导入的持仓可能没有交易历史）
+        _apply_capital_flow_cash(c, account_id, flow.flow_type, flow.amount)
         conn.commit()
 
     action = "转入" if flow.flow_type == "DEPOSIT" else "转出"
@@ -326,6 +339,8 @@ def delete_capital_flow(flow_id: int):
     """删除资金流水记录"""
     with get_db() as conn:
         c = conn.cursor()
+        # 先取写锁再读：并发删除同一笔流水时只能有一个请求冲销现金
+        conn.execute("BEGIN IMMEDIATE")
         c.execute("SELECT account_id, flow_type, amount FROM capital_flows WHERE id = ?", (flow_id,))
         row = c.fetchone()
         if not row:
@@ -334,8 +349,10 @@ def delete_capital_flow(flow_id: int):
         flow_type = row["flow_type"]
         amount = row["amount"]
         c.execute("DELETE FROM capital_flows WHERE id = ?", (flow_id,))
-        # 完整重放资金流水+交易，确保现金/持仓一致性
-        _rebuild_account_state(conn, account_id)
+        if c.rowcount != 1:
+            raise HTTPException(status_code=404, detail="Record not found")
+        # 反向冲销该笔流水的现金影响，不重放持仓
+        _apply_capital_flow_cash(c, account_id, flow_type, -amount)
         conn.commit()
 
     return {"status": "success", "message": "记录已删除"}

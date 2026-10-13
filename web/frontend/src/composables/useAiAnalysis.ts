@@ -2,7 +2,7 @@ import { ref } from 'vue'
 
 /**
  * AI 风险分析 Composable
- * 通过 SSE 流式调用本地 Ollama，逐 token 输出分析结果。
+ * 通过 SSE 流式调用工作站 sglang，逐 token 输出分析结果。
  * 使用 fetch() + ReadableStream 手动解析 SSE（而非 EventSource，
  * 因为 EventSource 不支持自定义请求头且错误处理有限）。
  */
@@ -33,6 +33,8 @@ export function useAiAnalysis() {
       const reader = resp.body!.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
+      // 同一 SSE 事件内的多行 data: 以换行拼接（后端把 token 中的换行拆成多行 data:）
+      let eventData: string[] = []
 
       while (true) {
         const { done, value } = await reader.read()
@@ -45,10 +47,11 @@ export function useAiAnalysis() {
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
-            aiResult.value += line.slice(6)
-          } else if (line.startsWith('event: error')) {
-            // 下一个 data: 行是错误消息，由下次循环捕获并追加到 aiResult
-            // 此处不单独处理，让用户看到错误内容
+            eventData.push(line.slice(6))
+          } else if (line === '') {
+            // 空行表示事件结束；error 事件的 data 同样追加，让用户看到错误内容
+            aiResult.value += eventData.join('\n')
+            eventData = []
           }
         }
       }

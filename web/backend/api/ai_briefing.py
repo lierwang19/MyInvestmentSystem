@@ -3,21 +3,18 @@
 AI Holdings Briefing — batch-generates AI summaries for all held stocks.
 Results are stored in ai_briefings table (one row per stock per day, overwrite on re-run).
 """
-import json
 import logging
 import threading
-import urllib.request
-import urllib.error
 
 from fastapi import APIRouter, HTTPException
 
 from web.backend.database import get_db
 from web.backend.config import USER_DB_PATH
 from web.backend.api.ai_analysis import (
-    _fetch_db_data, _fetch_news, _check_ollama,
+    _fetch_db_data, _fetch_news,
     _fmt, to_plain_code,
-    OLLAMA_BASE, OLLAMA_MODEL,
 )
+from web.backend.services import sglang_client
 from web.backend.time_utils import sh_batch_id, sh_date_str, sh_iso_str, sh_now
 
 logger = logging.getLogger(__name__)
@@ -38,26 +35,6 @@ BRIEFING_PROGRESS: dict = {
     "error": None,
 }
 _progress_lock = threading.Lock()
-
-
-# ── Ollama (non-streaming) ────────────────────────────────────────────────────
-
-def _call_ollama_sync(prompt: str, timeout: int = 300) -> str:
-    """Call Ollama and return the complete response text. Raises on failure."""
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.3, "num_predict": -1, "num_ctx": 8192},
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        f"{OLLAMA_BASE}/api/generate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read())
-    return result.get("response", "")
 
 
 # ── Briefing prompt (shorter than single-stock analysis) ─────────────────────
@@ -95,7 +72,7 @@ def _build_briefing_prompt(ts_code: str, name: str, data: dict, news_titles: lis
 
 def run_holdings_briefing() -> dict:
     """
-    Scan all distinct holdings, call Ollama for each, store in ai_briefings.
+    Scan all distinct holdings, call sglang for each, store in ai_briefings.
     Returns a summary dict. Safe to call from scheduler or manual trigger.
     """
     global BRIEFING_PROGRESS
@@ -157,9 +134,9 @@ def run_holdings_briefing() -> dict:
             )
             conn.commit()
 
-        # 4. Check Ollama availability — after pending rows are written so failures are visible
-        if not _check_ollama():
-            err_msg = f"Ollama 服务不可达（{OLLAMA_BASE}），请确认 Ollama 已启动"
+        # 4. Check sglang availability — after pending rows are written so failures are visible
+        if not sglang_client.check_sglang():
+            err_msg = sglang_client.unreachable_msg()
             with get_db() as conn:
                 conn.execute(
                     "UPDATE ai_briefings SET status='error', error_msg=? WHERE run_date=? AND batch_id=?",
@@ -185,7 +162,7 @@ def run_holdings_briefing() -> dict:
                 plain_code = to_plain_code(ts_code)
                 news_titles = _fetch_news(plain_code, limit=3)
                 prompt = _build_briefing_prompt(ts_code, name, data, news_titles)
-                content = _call_ollama_sync(prompt, timeout=300)
+                content = sglang_client.chat_sync(prompt, timeout=300)
                 duration = (sh_now() - t_start).total_seconds()
 
                 with get_db() as conn:

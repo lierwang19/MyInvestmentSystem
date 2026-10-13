@@ -41,7 +41,7 @@ def _init_ts():
 
 from web.backend.config import PROJECT_ROOT
 
-from web.backend.database import get_db, get_market_db
+from web.backend.database import get_db, get_market_db, get_market_db_rw
 from web.backend.api.settings import get_pb_settings
 from web.backend.time_utils import sh_now, sh_timestamp_str
 
@@ -357,7 +357,7 @@ def sync_market_data(start_date: Optional[str] = None):
                           'pb_high', 'pb_low', 'pb_close', 'net_assets', 'trade_date']
         
         # Insert into database (market.db)
-        with get_market_db() as conn:
+        with get_market_db_rw() as conn:
             if not conn:
                 return {"status": "error", "message": "market.db not found"}
             c = conn.cursor()

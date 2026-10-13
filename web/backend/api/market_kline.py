@@ -6,7 +6,7 @@ Extracted from market.py for cleaner module separation.
 from fastapi import APIRouter
 import logging
 
-from web.backend.database import get_market_db
+from web.backend.database import get_market_db, get_market_db_rw
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -20,7 +20,7 @@ def _ensure_market_monthly():
     global _market_monthly_initialized
     if _market_monthly_initialized:
         return
-    with get_market_db() as conn:
+    with get_market_db_rw() as conn:
         if conn is None:
             return
         conn.execute('''

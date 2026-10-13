@@ -128,9 +128,28 @@ def try_tushare(ts_code: str, start: str, end: str, token: str):
         pass
     return pd.DataFrame(), None
 
+def _default_db_path():
+    """data/market.db 优先；兼容项目根目录下的旧文件。"""
+    try:
+        from web.backend.config import resolve_db_path
+        return resolve_db_path("market.db")
+    except ImportError:
+        pass
+    # 独立运行、无法导入 web.backend 时：按脚本位置定位项目根目录，
+    # 用绝对路径并确保 data/ 存在，避免 CWD 相关的相对路径打不开库。
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(root, "data")
+    new_path = os.path.join(data_dir, "market.db")
+    old_path = os.path.join(root, "market.db")
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        os.makedirs(data_dir, exist_ok=True)
+        return new_path
+    return old_path
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="market.db")
+    ap.add_argument("--db", default=_default_db_path())
     ap.add_argument("--failed", default="logs/backfill_start_failed.csv")
     ap.add_argument("--codes", default="")
     ap.add_argument("--ak-order", default="tx,sina,em")

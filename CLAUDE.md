@@ -15,7 +15,7 @@
 
 本项目是一套**量化投资管理系统**，主要面向 A 股市场，包含以下核心能力：
 
-- **数据管道层**（ETL）：从 tushare / akshare / 通达信 获取行情和财务数据，写入 `market.db`
+- **数据管道层**（ETL）：从 tushare / akshare / 通达信 获取行情和财务数据，写入 `data/market.db`
 - **打分选股引擎**：基于 YAML 配置的行业锚点 + PB/PE/距离低点 加权打分
 - **Web 管理界面**：持仓管理、交易记录、资产分析、优选池、行情概览
 - **定时任务**：每日自动更新行情、计算因子、拍快照、刷新打分
@@ -56,8 +56,9 @@ myinvestmentsystem/
 ├── docs/                      # 项目文档（SOP、实施计划、投资理念）
 ├── data/                      # 运行时数据目录（.gitignore）
 ├── logs/                      # 日志目录（.gitignore）
-├── market.db                  # 行情数据库 ~3GB（.gitignore）
-├── user_data.db               # 用户数据库基线种子文件（仓库跟踪）
+├── data/
+│   ├── market.db              # 行情数据库 ~3GB（.gitignore，随 Docker 卷挂载）
+│   └── user_data.db           # 用户数据库（.gitignore；WAL 模式）
 ├── docker-compose.yml         # Docker 部署编排
 ├── .env.example               # 环境变量模板（TUSHARE_TOKEN）
 └── .gitignore
@@ -70,7 +71,7 @@ myinvestmentsystem/
 | 层 | 技术 |
 |---|---|
 | **后端** | Python 3 + FastAPI + Uvicorn |
-| **数据库** | SQLite（`market.db` 行情 / `user_data.db` 用户数据） |
+| **数据库** | SQLite（`data/market.db` 行情 / `data/user_data.db` 用户数据） |
 | **前端** | Vue 3 + TypeScript + Vite + Element Plus + ECharts |
 | **状态管理** | Pinia |
 | **定时任务** | APScheduler |
@@ -81,13 +82,13 @@ myinvestmentsystem/
 
 ## 关键数据库
 
-### market.db（行情库，~3GB）
+### data/market.db（行情库，~3GB）
 
 - `daily_price`：日线行情（open, high, low, close, vol, amount）
 - `fundamentals`：估值因子（pb, pe_ttm, total_mv 等）
 - 由 ETL 脚本维护，只读使用
 
-### user_data.db（用户库）
+### data/user_data.db（用户库）
 
 - `accounts`：证券账户
 - `brokers`：券商费率
@@ -105,7 +106,7 @@ myinvestmentsystem/
 
 | 任务 | 默认时间 | 说明 |
 |------|---------|------|
-| `market_update` | 17:00 | 拉取日线行情写入 `market.db` |
+| `market_update` | 17:00 | 拉取日线行情写入 `data/market.db` |
 | `factor_build` | 17:15 | 重算 PB/PE 因子，生成 `market_enriched.csv` |
 | `asset_snapshot` | 17:20 | 记录各账户净值 |
 | `scoring` | 17:30 | YAML 驱动的全市场打分 |
@@ -232,14 +233,66 @@ docker-compose up -d --build
 # 前端: http://localhost:8080
 ```
 
+### Docker 升级迁移（B1：旧部署必读）
+
+新版 `docker-compose.yml` 删除了根目录单文件挂载（`./market.db:/app/market.db`、
+`./user_data.db:/app/user_data.db`），只保留 `./data:/app/data` 目录卷。
+**容器内已看不到宿主机根目录的旧库**，`resolve_db_path()` 的旧路径回退在容器里
+是失效的——不迁移就直接 `up` 会生成空库。升级必须按顺序执行：
+
+```bash
+(
+set -eu
+docker-compose down
+# 同时关闭本地后端及所有 ETL/其他 SQLite 连接；迁移期间不可写库。
+mkdir -p data
+# 先检查两个库及全部目标，避免覆盖已有库或迁移到一半才发现冲突。
+for db in market.db user_data.db; do
+    test -f "$db" || { echo "缺少旧库：$db，停止迁移" >&2; exit 1; }
+    for suffix in '' -wal -shm; do
+        test ! -e "data/$db$suffix" || { echo "目标已存在：data/$db$suffix，停止迁移" >&2; exit 1; }
+    done
+done
+for db in market.db user_data.db; do
+    for suffix in '' -wal -shm; do
+        if test -f "$db$suffix"; then
+            mv "$db$suffix" "data/$db$suffix"
+        fi
+    done
+done
+# 确认读取的主库及 WAL 完整，错误时不启动。
+python3 - <<'PY'
+import sqlite3
+from pathlib import Path
+for name in ('market.db', 'user_data.db'):
+    with sqlite3.connect((Path('data') / name).resolve().as_uri() + '?mode=ro', uri=True) as conn:
+        if conn.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+            raise SystemExit(f'{name} 完整性检查失败，停止启动')
+PY
+docker-compose up -d --build
+docker-compose logs backend | grep -E '(user_data|market)\.db ->'
+)
+```
+
+日志应显示两个 `data/` 路径均“已存在”。迁移失败后先检查已移动的文件，
+不要直接启动，也不要覆盖 `data/` 中已有的数据库。
+
+### 恢复用户数据库
+
+`/api/system/restore` 会校验完整性和必要业务表，将数据库暂存为
+`data/user_data.db.restore-pending`，不会在线覆盖主库或删除 WAL/SHM。
+上传成功后停止所有本地 ETL，重启后端；启动阶段在后台服务运行前以 SQLite
+backup API 应用快照，再执行建表和迁移。有其他活动连接时恢复失败并阻止启动，
+暂存文件保留供重试。重启前的写入会被备份快照取代，上传后应立即安排重启。
+
 ### 运行 ETL 脚本
 
 ```bash
 # 示例：行情入库
-python scripts/etl/get_market_data_db_robust.py --end-target today --db market.db
+python scripts/etl/get_market_data_db_robust.py --end-target today --db data/market.db
 
 # 示例：生成 market_enriched.csv
-python scripts/etl/make_market_enriched_from_db.py --base stock_industry_base.csv --db market.db --out market_enriched.csv
+python scripts/etl/make_market_enriched_from_db.py --base stock_industry_base.csv --db data/market.db --out market_enriched.csv
 
 # 示例：全市场打分
 python scripts/scoring/score_universe.py
@@ -248,11 +301,27 @@ python scripts/scoring/score_universe.py
 ### 运行测试
 
 ```bash
-# 后端脚本测试
-python -m pytest scripts/tests/
+# 后端：首次安装独立 Python 3.11 环境及锁定依赖（需要 uv 和网络）
+bash scripts/tools/setup_backend_tests.sh
+
+# 后端完整 pytest 测试集，默认 scripts/tests/
+.test-env/venv/bin/python -m pytest
+
+# 可选：覆盖率报告
+.test-env/venv/bin/python -m pytest --cov=web.backend --cov=scripts --cov-report=term-missing
 
 # 前端测试
 cd web/frontend && npm run test
+```
+
+后端测试使用临时数据库，每条测试单独初始化；默认禁止工作区数据库连接和
+外部网络调用。测试应 mock 行情/HTTP 数据源。`.test-env/` 中的解释器、虚拟环境
+和缓存不纳入 Git；`web/backend/requirements-test.txt` 锁定全部测试及运行依赖。
+运行依赖或测试工具变更后，用下面的命令重新生成锁文件，再运行安装脚本：
+
+```bash
+uv pip compile --python .test-env/venv/bin/python --cache-dir .test-env/cache \
+  web/backend/requirements-test.in --output-file web/backend/requirements-test.txt
 ```
 
 ---
@@ -286,8 +355,9 @@ cd web/frontend && npm run test
 
 ## 注意事项
 
-- `market.db` 约 3GB，不纳入 Git 管理
-- `user_data.db` 在仓库中保留一份基线种子库，用于 fresh clone / Docker Compose 启动；本地真实业务数据不要直接提交回仓库
+- `data/market.db` 约 3GB，不纳入 Git 管理；`data/` 目录已挂载为 Docker 卷，保证 WAL 文件与主库同卷
+- `data/user_data.db` 为用户库（WAL 模式）；旧版根目录下的 `*.db` 文件会被自动兼容读取，
+  建议手动移动到 `data/` 目录以享受卷挂载保护
 - `stock_industry_base.csv`、`market_enriched.csv` 等运行时生成的 CSV 不纳入 Git 管理
 - 前端使用 `vue-tsc` 做类型检查，修改 `.vue` 文件时注意类型标注
 - 后端使用 `python -m` 方式运行以确保 `web.backend` 包路径正确

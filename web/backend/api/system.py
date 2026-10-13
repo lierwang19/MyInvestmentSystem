@@ -19,7 +19,7 @@ REFRESH_STATE = {
     "last_error": None
 }
 
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH, USER_DB_PATH
 from web.backend.time_utils import sh_compact_timestamp, sh_now, sh_timestamp_str
 from web.backend.upload_security import MAX_GENERIC_UPLOAD_BYTES, read_limited_upload
 
@@ -33,7 +33,7 @@ def run_market_refresh_script():
     
     script_path = os.path.join(PROJECT_ROOT, "scripts", "etl", "make_market_enriched_from_db.py")
     base_file = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
-    db_file = os.path.join(PROJECT_ROOT, "market.db")
+    db_file = MARKET_DB_PATH
     
     # Check dependencies
     if not os.path.exists(db_file):
@@ -216,7 +216,7 @@ def run_etl_market_script(mode: str = "full"):
             return
 
     script_path = os.path.join(PROJECT_ROOT, "scripts", "etl", "get_market_data_db_robust.py")
-    db_path     = os.path.join(PROJECT_ROOT, "market.db")
+    db_path     = MARKET_DB_PATH
     out_path    = os.path.join(PROJECT_ROOT, "market_enriched.csv")
     base_path   = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
 
@@ -413,9 +413,9 @@ async def get_system_status():
             status["data_date_error"] = str(e)
     
     # Get market.db latest date
-    from web.backend.database import get_market_db
+    from web.backend.database import get_market_db_rw
     try:
-        with get_market_db() as conn:
+        with get_market_db_rw() as conn:
             if conn:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_daily_price_trade_date ON daily_price(trade_date)")
                 row = conn.execute("SELECT MAX(trade_date) FROM daily_price").fetchone()
@@ -477,10 +477,31 @@ def backup_system_data():
     mem_zip = io.BytesIO()
     
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # Add user_data.db
-        db_path = os.path.join(PROJECT_ROOT, "user_data.db")
+        # Add user_data.db (stored under data/ to keep WAL sidecars in the mounted volume)
+        db_path = USER_DB_PATH
         if os.path.exists(db_path):
-            zf.write(db_path, "user_data.db")
+            # B2: 用 SQLite backup API 生成一致性快照再打包。
+            # WAL 模式下 checkpoint 可能被读事务阻塞（返回 busy），直接复制主库文件
+            # 会静默遗漏 WAL 中已提交的数据；backup API 则保证快照是某个提交点的
+            # 完整一致副本，不受 busy 状态影响，也无需事先 checkpoint。
+            import sqlite3
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            try:
+                src = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+                try:
+                    dst = sqlite3.connect(tmp_path, timeout=15)
+                    try:
+                        src.backup(dst)
+                    finally:
+                        dst.close()
+                finally:
+                    src.close()
+                zf.write(tmp_path, "data/user_data.db")
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
             
         # Add config folder
         config_dir = os.path.join(PROJECT_ROOT, "config")
@@ -507,46 +528,141 @@ async def restore_system_data(file: UploadFile):
     
     if not file.filename.endswith(".zip"):
         return {"status": "error", "message": "Invalid file type. Please upload a .zip file."}
-    
+
+    # W5: 旧路径兼容模式下拒绝恢复。启动时 USER_DB_PATH 若仍指向根目录旧库，
+    # 恢复却会写入 data/user_data.db，当前进程继续读写旧库、重启后才切换，
+    # 新旧数据分叉。先迁移 DB 到 data/ 并重启，再做恢复。
+    _canonical_user_db = os.path.abspath(os.path.join(PROJECT_ROOT, "data", "user_data.db"))
+    if os.path.abspath(USER_DB_PATH) != _canonical_user_db:
+        return {"status": "error",
+                "message": "检测到数据库仍在旧位置（项目根目录）。请先将其移动到 data/ 目录并重启后端，再恢复备份，避免新旧库数据分叉。"}
+
     try:
         # Read uploaded zip
         content = await file.read()
         import io
+        import tempfile
+        from web.backend.database import pending_restore_path, validate_user_db
         zip_file = io.BytesIO(content)
-        
+
         # Verify zip
         if not zipfile.is_zipfile(zip_file):
              return {"status": "error", "message": "Invalid zip file."}
-             
+
         # Extract
         with zipfile.ZipFile(zip_file, 'r') as zf:
-            allowed_files = []
-            for info in zf.infolist():
-                member_name = _normalize_restore_member_name(info.filename)
-                if member_name is None:
-                    continue
-                allowed_files.append(member_name)
-            
-            if not allowed_files:
-                return {"status": "warning", "message": "No valid backup files found in zip (user_data.db or config/)"}
-            
-            restored_count = 0
-            for member_name in allowed_files:
-                target_path = _resolve_restore_target(member_name)
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+            # W4: 保留 (zip 内原始名, 映射后目标名)：读取必须用原始名
+            #（旧备份包里是根目录的 user_data.db），落盘才用映射名。
+            pairs = _collect_restore_pairs(zf)
 
-                with zf.open(member_name) as src, open(target_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                restored_count += 1
-            
-        return {"status": "success", "message": f"Restored {restored_count} files. Please restart the backend if config changed."}
-        
+            if not pairs:
+                return {"status": "warning", "message": "No valid backup files found in zip (user_data.db or config/)"}
+
+            # 阶段 1：整包解压到临时文件并全部校验；任何失败都不改动现有文件
+            staged = []      # [(tmp_path, target_path, is_db)]
+            replaced = []    # [(target_path, backup_path or None)]
+            kept_backups = []  # 回滚失败、需保留的 [(target_path, backup_path)]
+            try:
+                for original_name, target_name in pairs:
+                    target_path = _resolve_restore_target(target_name)
+                    if target_path.exists() and not target_path.is_file():
+                        raise ValueError(f"恢复目标已存在且不是普通文件：{target_name}")
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    fd, tmp_path = tempfile.mkstemp(suffix=".restore-tmp", dir=str(target_path.parent))
+                    os.close(fd)
+                    staged.append((tmp_path, target_path, target_name == "data/user_data.db"))
+                    with zf.open(original_name) as src, open(tmp_path, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    if target_name == "data/user_data.db":
+                        validate_user_db(tmp_path)
+
+                # 阶段 2：替换配置文件（保留原文件以便回滚）
+                for tmp_path, target_path, is_db in staged:
+                    if is_db:
+                        continue
+                    backup_path = None
+                    if target_path.exists():
+                        fd, backup_path = tempfile.mkstemp(suffix=".restore-bak", dir=str(target_path.parent))
+                        os.close(fd)
+                        try:
+                            os.replace(target_path, backup_path)
+                        except OSError:
+                            os.unlink(backup_path)
+                            raise
+                    replaced.append((target_path, backup_path))
+                    os.replace(tmp_path, target_path)
+
+                # 阶段 3：最后才发布数据库暂存文件。Startup applies it via SQLite
+                # before background services start; never replace a live DB
+                # or remove its WAL/SHM while existing connections are open.
+                for tmp_path, _, is_db in staged:
+                    if is_db:
+                        os.replace(tmp_path, pending_restore_path(USER_DB_PATH))
+            except Exception as restore_error:
+                # 回滚已替换的配置；已有的待恢复快照不受影响（仅成功时才被覆盖）
+                for target_path, backup_path in reversed(replaced):
+                    try:
+                        if backup_path:
+                            os.replace(backup_path, target_path)
+                        elif target_path.exists():
+                            target_path.unlink()
+                    except OSError:
+                        if backup_path:
+                            # 回滚失败的备份是原配置的唯一副本，必须保留供人工恢复
+                            kept_backups.append((target_path, backup_path))
+                        logger.exception("恢复回滚失败：%s（原配置备份：%s）", target_path, backup_path)
+                if kept_backups:
+                    hints = "；".join(f"{b} → {t}" for t, b in kept_backups)
+                    raise RuntimeError(
+                        f"{restore_error}。配置回滚失败，原配置备份已保留，请手动复制回原位置：{hints}"
+                    ) from restore_error
+                raise
+            finally:
+                # 提交点是发布 .restore-pending；此后的临时文件清理失败只记警告，
+                # 不能把已生效的恢复报告为失败。回滚失败保留的备份不删除。
+                kept = {b for _, b in kept_backups}
+                leftovers = [t for t, _, _ in staged] + [b for _, b in replaced if b and b not in kept]
+                for leftover in leftovers:
+                    try:
+                        if os.path.exists(leftover):
+                            os.unlink(leftover)
+                    except OSError:
+                        logger.warning("恢复临时文件清理失败，可手动删除：%s", leftover, exc_info=True)
+            restored_count = len(staged)
+
+        return {"status": "success",
+                "message": f"已接收 {restored_count} 个备份文件。用户数据库仅暂存，重启后端后才会生效；重启前继续使用当前数据库。"}
+
     except Exception as e:
         return {"status": "error", "message": f"Restore failed: {str(e)}"}
 
 
+def _collect_restore_pairs(zf):
+    """收集 [(zip 内原始成员名, 映射后目标名)]。
+
+    读取 zip 内容必须用原始成员名（旧备份包里 user_data.db 在根目录），
+    而落盘目标用映射后的名字（统一为 data/user_data.db）。
+    """
+    pairs = []
+    targets = set()
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        target_name = _normalize_restore_member_name(info.filename)
+        if target_name is None:
+            continue
+        if target_name in targets:
+            raise ValueError(f"备份包含重复恢复目标：{target_name}")
+        targets.add(target_name)
+        pairs.append((info.filename, target_name))
+    return pairs
+
+
 def _normalize_restore_member_name(name: str) -> str | None:
-    """只允许恢复 user_data.db 和 config/ 下的普通文件。"""
+    """只允许恢复 data/user_data.db 和 config/ 下的普通文件。
+
+    兼容旧版备份包中位于 zip 根目录的 ``user_data.db``，统一映射到新位置。
+    """
     normalized = PurePosixPath(name)
 
     if not name or normalized.is_absolute():
@@ -557,8 +673,8 @@ def _normalize_restore_member_name(name: str) -> str | None:
         return None
 
     normalized_name = normalized.as_posix()
-    if normalized_name == "user_data.db":
-        return normalized_name
+    if normalized_name in {"data/user_data.db", "user_data.db"}:
+        return "data/user_data.db"
     if parts[0] == "config" and len(parts) > 1:
         return normalized_name
     return None
@@ -567,7 +683,7 @@ def _normalize_restore_member_name(name: str) -> str | None:
 def _resolve_restore_target(member_name: str) -> Path:
     project_root = Path(PROJECT_ROOT).resolve()
     target_path = (project_root / member_name).resolve()
-    if project_root not in target_path.parents and target_path != project_root / "user_data.db":
+    if project_root not in target_path.parents and target_path != project_root / "data" / "user_data.db":
         raise ValueError(f"Unsafe restore target: {member_name}")
     return target_path
 
@@ -605,7 +721,7 @@ def get_data_health():
     health = {}
 
     # 1. market.db
-    market_db = os.path.join(PROJECT_ROOT, "market.db")
+    market_db = MARKET_DB_PATH
     if os.path.exists(market_db):
         sz = round(os.path.getsize(market_db) / 1024 / 1024, 1)
         from web.backend.database import get_market_db
@@ -639,7 +755,7 @@ def get_data_health():
 
     # 2. user_data.db
     from web.backend.database import get_db
-    user_db = os.path.join(PROJECT_ROOT, "user_data.db")
+    user_db = USER_DB_PATH
     if os.path.exists(user_db):
         sz = round(os.path.getsize(user_db) / 1024 / 1024, 1)
         with get_db() as conn:
@@ -1206,7 +1322,7 @@ def run_valuation_etl_script(mode: str = "holdings", ts_codes: list = None, forc
             return
 
     script_path = os.path.join(PROJECT_ROOT, "scripts", "etl", "build_fundamentals_and_valuation.py")
-    db_path = os.path.join(PROJECT_ROOT, "market.db")
+    db_path = MARKET_DB_PATH
     base_path = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
 
     def _val_release_lock_and_resume():
@@ -1626,8 +1742,8 @@ def _run_hk_price_sync(start: str | None, codes: list[str] | None) -> None:
     global HK_PRICE_STATE
 
     script = os.path.join(PROJECT_ROOT, "scripts", "etl", "sync_hk_daily_prices.py")
-    user_db = os.path.join(PROJECT_ROOT, "user_data.db")
-    market_db = os.path.join(PROJECT_ROOT, "market.db")
+    user_db = USER_DB_PATH
+    market_db = MARKET_DB_PATH
 
     if not os.path.isfile(market_db):
         HK_PRICE_STATE["status"] = "error"

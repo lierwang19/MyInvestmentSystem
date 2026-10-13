@@ -213,7 +213,8 @@ def main():
     else:
         print("✅ Portfolio adheres to the < 2/3 capital limit.")
 
-    out_file = "portfolio_suggestion.csv"
+    out_file = "data/portfolio_suggestion.csv"
+    os.makedirs("data", exist_ok=True)
     res_df.to_csv(out_file, index=False, encoding="utf-8-sig")
     print(f"\nDetailed suggestion saved to: {out_file}")
     

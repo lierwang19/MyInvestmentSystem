@@ -10,10 +10,11 @@ services:
       - ./data:/app/data
       - ./config:/app/config
       - ./logs:/app/logs
-      - ./market.db:/app/market.db
       - ./stock_industry_base.csv:/app/stock_industry_base.csv
       - ./market_enriched.csv:/app/market_enriched.csv
-      - ./user_data.db:/app/user_data.db
+      # 注意：market.db / user_data.db 统一放在 ./data/ 目录下，
+      # 以目录形式挂载，保证 SQLite WAL/SHM 文件与主库始终在同一卷中，
+      # 避免容器重建时丢失未 checkpoint 的写入。
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -22,7 +23,9 @@ services:
       - SINGLE_USER_MODE=${SINGLE_USER_MODE:-}
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - TZ=${TZ:-Asia/Shanghai}
-      - OLLAMA_HOST=host.docker.internal
+      # AI 简报走工作站 sglang（经 Mac 上的 SSH 隧道 127.0.0.1:18100）
+      - SGLANG_BASE_URL=${SGLANG_BASE_URL:-http://host.docker.internal:18100}
+      - SGLANG_MODEL=${SGLANG_MODEL:-qwen}
     dns:
       - 114.114.114.114
       - 223.5.5.5

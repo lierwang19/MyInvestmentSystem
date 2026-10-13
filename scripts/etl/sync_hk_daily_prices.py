@@ -35,10 +35,19 @@ from typing import Optional
 
 import pandas as pd
 
-# ── 路径常量 ──
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-USER_DB      = os.path.join(PROJECT_ROOT, "user_data.db")
-MARKET_DB    = os.path.join(PROJECT_ROOT, "market.db")
+# ── 路径常量（DB 统一走 data/ 目录，含旧位置兼容）──
+try:
+    from web.backend.config import USER_DB_PATH as USER_DB, MARKET_DB_PATH as MARKET_DB
+except ImportError:
+    _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    def _resolve_db(name):
+        new = os.path.join(_ROOT, "data", name)
+        if os.path.exists(new):
+            return new
+        old = os.path.join(_ROOT, name)
+        return old if os.path.exists(old) else new
+    USER_DB = _resolve_db("user_data.db")
+    MARKET_DB = _resolve_db("market.db")
 
 # 防止继承本机代理导致 AkShare 请求被错误转发到失效本地端口
 for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):

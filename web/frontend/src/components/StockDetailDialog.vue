@@ -307,8 +307,13 @@ const deleteTransaction = async (row: any) => {
             '删除交易记录',
             { confirmButtonText: '确认删除', cancelButtonText: '取消', type: 'warning' }
         )
-        await api.delete(`/api/transactions/${row.id}`)
-        ElMessage.success('已删除，持仓已自动还原')
+        const res = await api.delete(`/api/transactions/${row.id}`)
+        // 历史不完整（快照持仓）时后端只冲销资金、不重算持仓，需提示用户手工核对
+        if (res.data?.holdings_rebuilt === false) {
+            ElMessage({ type: 'warning', message: res.data.warning, duration: 0, showClose: true })
+        } else {
+            ElMessage.success('已删除，持仓已自动还原')
+        }
         if (currentStock.value) await loadStockDetail(currentStock.value)
         emit('transactionChanged')
     } catch (e: any) {
@@ -320,14 +325,24 @@ const deleteTransaction = async (row: any) => {
 const openRerecord = async (row: any) => {
     try {
         await ElMessageBox.confirm(
-            `此操作将先删除这条 ${getTransLabel(row.trans_type)} 记录（${row.date}，¥${row.price} × ${Math.abs(row.amount)} 股），持仓和资金自动还原，然后打开预填表单让你重新录入正确数据。`,
+            `此操作将先删除这条 ${getTransLabel(row.trans_type)} 记录（${row.date}，¥${row.price} × ${Math.abs(row.amount)} 股），资金自动冲销，持仓是否自动还原以删除结果为准；还原成功后会打开预填表单让你重新录入正确数据。`,
             '删除并重录',
             { confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning' }
         )
-        await api.delete(`/api/transactions/${row.id}`)
-        ElMessage.success('原记录已删除，请录入正确数据')
+        const res = await api.delete(`/api/transactions/${row.id}`)
         if (currentStock.value) await loadStockDetail(currentStock.value)
         emit('transactionChanged')
+        // 持仓未自动还原（快照持仓）时中止重录：否则重录会在未扣减的持仓上再叠加一次
+        if (res.data?.holdings_rebuilt === false) {
+            ElMessage({
+                type: 'warning',
+                message: `${res.data.warning} 已取消自动重录：请先核对并修正持仓，再手工录入正确交易。`,
+                duration: 0,
+                showClose: true
+            })
+            return
+        }
+        ElMessage.success('原记录已删除，请录入正确数据')
         // Open pre-filled dialog after deletion
         rerecordType.value = row.trans_type as typeof rerecordType.value
         rerecordPrefill.value = {

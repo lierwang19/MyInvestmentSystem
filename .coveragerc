@@ -1,0 +1,6 @@
+[run]
+data_file = test-results/.coverage
+relative_files = True
+
+[report]
+show_missing = True

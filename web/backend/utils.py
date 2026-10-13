@@ -27,6 +27,17 @@ def normalize_code(code: str) -> str:
     return f"{code}.SZ"
 
 
+def is_iso_date(value) -> bool:
+    """严格校验补零的 YYYY-MM-DD；库内按字符串比较/排序日期，'2026-2-1' 这类必须拒绝。"""
+    from datetime import datetime
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
+    except ValueError:
+        return False
+
+
 def valid_float(val, default=0.0) -> float:
     """Ensure value is a valid float for JSON serialization (no NaN/Inf)."""
     if val is None:

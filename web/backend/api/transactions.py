@@ -10,9 +10,10 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import logging
+import math
 
 from web.backend.database import get_db
-from web.backend.utils import valid_float
+from web.backend.utils import valid_float, is_iso_date
 from web.backend.time_utils import sh_date_str, sh_timestamp_str, sh_today
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,28 @@ class TransactionCreate(BaseModel):
     stamp_tax: float = 0.0
     buy_pb: Optional[float] = None   # PB at buy time; stored for from_buy_pb sell bucketing
     remarks: Optional[str] = None
+
+VALID_TRANS_TYPES = ('BUY', 'SELL', 'SPLIT', 'RIGHTS', 'DIVIDEND', 'DIVIDEND_TAX')
+
+
+def _validate_transaction(trans: TransactionCreate):
+    """拒绝非法交易输入；数量符号沿用现有约定（SELL 允许负数，统一取 abs）。"""
+    if trans.trans_type not in VALID_TRANS_TYPES:
+        raise HTTPException(status_code=400, detail=f"不支持的交易类型: {trans.trans_type}")
+    if not trans.ts_code or not trans.ts_code.strip():
+        raise HTTPException(status_code=400, detail="股票代码不能为空")
+    for label, value in (("价格", trans.price), ("手续费", trans.fee), ("印花税", trans.stamp_tax)):
+        if not math.isfinite(value) or value < 0:
+            raise HTTPException(status_code=400, detail=f"{label}必须是非负有限数值")
+    if trans.buy_pb is not None and not math.isfinite(trans.buy_pb):
+        raise HTTPException(status_code=400, detail="买入 PB 必须是有限数值")
+    if trans.amount == 0:
+        raise HTTPException(status_code=400, detail="数量不能为 0")
+    if trans.trans_type in ('BUY', 'SELL') and trans.price <= 0:
+        raise HTTPException(status_code=400, detail="买入/卖出价格必须大于 0")
+    if not is_iso_date(trans.date):
+        raise HTTPException(status_code=400, detail="日期格式必须为补零的 YYYY-MM-DD")
+
 
 class CostUpdateRequest(BaseModel):
     cost_price: float
@@ -98,10 +121,59 @@ def get_transactions(account_id: str, ts_code: Optional[str] = None):
 @router.post("/transactions/{account_id}")
 def create_transaction(account_id: str, trans: TransactionCreate):
     """Create a new transaction (Buy/Sell/Dividend)"""
+    _validate_transaction(trans)
     now_ts = sh_timestamp_str()
     with get_db() as conn:
         c = conn.cursor()
-        
+        # 先取写锁：校验持仓与写入处于同一事务，避免并发卖出同时通过检查
+        conn.execute('BEGIN IMMEDIATE')
+
+        c.execute('SELECT 1 FROM accounts WHERE id = ?', (account_id,))
+        if not c.fetchone():
+            raise HTTPException(status_code=404, detail="Account not found")
+
+        # 卖出不能超过当前持仓（拒绝时不写交易、不动现金）
+        if trans.trans_type == 'SELL':
+            c.execute('SELECT quantity FROM holdings WHERE account_id = ? AND ts_code = ?',
+                      (account_id, trans.ts_code))
+            held_row = c.fetchone()
+            held_qty = held_row['quantity'] if held_row and held_row['quantity'] else 0
+            if abs(trans.amount) > held_qty:
+                raise HTTPException(status_code=400,
+                                    detail=f"卖出数量 {abs(trans.amount)} 超过当前持仓 {held_qty}")
+
+        # 补录：已有晚于本笔日期的交易时，写入后需按时间重放该股票持仓
+        c.execute('SELECT 1 FROM transactions WHERE account_id = ? AND ts_code = ? AND date > ? LIMIT 1',
+                  (account_id, trans.ts_code, trans.date))
+        is_backdated = c.fetchone() is not None
+
+        if is_backdated:
+            c.execute('''
+                SELECT trans_type, amount, total_amt, fee, stamp_tax, date
+                FROM transactions
+                WHERE account_id = ? AND ts_code = ?
+                ORDER BY date ASC, id ASC
+            ''', (account_id, trans.ts_code))
+            history = [dict(r) for r in c.fetchall()]
+
+            # 历史不完整（快照导入/手工改过成本）时，重放会覆盖基线：拒绝自动补录
+            reason = _history_incomplete_reason(c, account_id, trans.ts_code, history)
+            if reason:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"该股票{reason}。为避免覆盖，暂不支持补录早于已有交易的记录；"
+                            f"请按最新日期录入，或先补全交易历史。"))
+
+            # 按日期插入完整序列，逐笔检查每次卖出时的可卖数量
+            new_row = {'trans_type': trans.trans_type, 'amount': trans.amount,
+                       'total_amt': 0, 'fee': 0, 'stamp_tax': 0, 'date': trans.date}
+            pos = next((i for i, r in enumerate(history) if r['date'] > trans.date), len(history))
+            _, _, oversell = _replay_position(history[:pos] + [new_row] + history[pos:])
+            if oversell is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"补录后 {oversell['date']} 的卖出 {abs(oversell['amount'])} 股超过当时持仓")
+
         # Get account's broker settings for fee calculation
         c.execute('''
             SELECT b.commission_rate, b.min_commission, b.stamp_tax_rate, b.transfer_fee_rate
@@ -311,6 +383,16 @@ def create_transaction(account_id: str, trans: TransactionCreate):
                          (tax_amount, account_id))
                 net_cash_change = -tax_amount
 
+            # 补录历史交易：增量结果与按时间重放不一致，以重放为准
+            if is_backdated:
+                c.execute('SELECT buy_pb FROM holdings WHERE account_id = ? AND ts_code = ?',
+                          (account_id, trans.ts_code))
+                pb_row = c.fetchone()
+                fallback_buy_pb = (pb_row['buy_pb'] if pb_row and pb_row['buy_pb'] is not None
+                                   else (trans.buy_pb or 0.0))
+                _rebuild_single_stock_holdings(conn, account_id, trans.ts_code,
+                                               fallback_buy_pb=fallback_buy_pb)
+
             conn.commit()
             return {
                 "status": "success",
@@ -326,6 +408,81 @@ def create_transaction(account_id: str, trans: TransactionCreate):
 
 
 # --- Holdings Rebuild Helpers ---
+
+def _replay_position(txns):
+    """按时间顺序重放交易，返回 (quantity, total_cost, first_oversell)。
+
+    规则与 create_transaction 一致（净投入法 + 清仓截断）。first_oversell 为第一笔
+    卖出数量超过当时持仓的交易（无则 None）；超卖时数量截断为 0，与历史行为一致。
+    """
+    quantity = 0
+    total_cost = 0.0
+    first_oversell = None
+
+    for txn in txns:
+        t = txn['trans_type']
+        amt = txn['amount']
+        total_amt_val = txn['total_amt'] or 0
+        fee = txn['fee'] or 0
+        stamp_tax = txn['stamp_tax'] or 0
+
+        if t == 'BUY':
+            quantity += abs(amt)
+            total_cost += total_amt_val + fee
+        elif t == 'SELL':
+            if abs(amt) > quantity and first_oversell is None:
+                first_oversell = txn
+            quantity -= abs(amt)
+            total_cost -= (total_amt_val - fee - stamp_tax)
+            if quantity <= 0:
+                quantity = 0
+                total_cost = 0.0   # 清仓截断
+        elif t == 'SPLIT':
+            quantity += abs(amt)   # total_cost unchanged
+        elif t == 'RIGHTS':
+            quantity += abs(amt)
+            total_cost += total_amt_val + fee + stamp_tax
+        elif t == 'DIVIDEND':
+            # Only reduce cost when currently holding (mirrors create_transaction logic)
+            if quantity > 0:
+                total_cost -= total_amt_val
+        elif t == 'DIVIDEND_TAX':
+            # Only increase cost when currently holding (mirrors create_transaction logic)
+            if quantity > 0:
+                total_cost += total_amt_val
+
+    return quantity, total_cost, first_oversell
+
+
+def _history_incomplete_reason(c, account_id: str, ts_code: str, history=None):
+    """交易历史能否完整解释当前持仓；不能时返回原因文本，能则返回 None。
+
+    两种情况视为不完整（快照导入/手工改过成本）：
+    - 已有历史本身出现超卖（如快照持仓卖出后清仓），说明缺少早期买入记录
+    - 当前持仓数量/成本与按交易记录重放的结果不一致
+    """
+    if history is None:
+        c.execute('''
+            SELECT trans_type, amount, total_amt, fee, stamp_tax, date
+            FROM transactions
+            WHERE account_id = ? AND ts_code = ?
+            ORDER BY date ASC, id ASC
+        ''', (account_id, ts_code))
+        history = c.fetchall()
+    replay_qty, replay_cost, history_oversell = _replay_position(history)
+    c.execute('SELECT quantity, total_cost FROM holdings WHERE account_id = ? AND ts_code = ?',
+              (account_id, ts_code))
+    h = c.fetchone()
+    held_qty = (h['quantity'] or 0) if h else 0
+    held_cost = (h['total_cost'] or 0.0) if h else 0.0
+    if history_oversell is not None:
+        return (f"已有交易记录中 {history_oversell['date']} 的卖出 "
+                f"{abs(history_oversell['amount'])} 股缺少对应的买入记录（可能来自快照导入的持仓）")
+    if held_qty != replay_qty or abs(held_cost - replay_cost) > 0.05:
+        return (f"当前持仓（{held_qty} 股，成本 {held_cost:.2f}）与交易记录重算结果"
+                f"（{replay_qty} 股，成本 {replay_cost:.2f}）不一致，可能含快照导入或手工修改的持仓")
+    return None
+
 
 def _rebuild_single_stock_holdings(conn, account_id: str, ts_code: str, fallback_buy_pb: float = 0.0):
     """
@@ -349,39 +506,7 @@ def _rebuild_single_stock_holdings(conn, account_id: str, ts_code: str, fallback
     ''', (account_id, ts_code))
     txns = c.fetchall()
 
-    # Replay using the same rules as create_transaction
-    quantity = 0
-    total_cost = 0.0
-
-    for txn in txns:
-        t = txn['trans_type']
-        amt = txn['amount']
-        total_amt_val = txn['total_amt']
-        fee = txn['fee']
-        stamp_tax = txn['stamp_tax']
-
-        if t == 'BUY':
-            quantity += abs(amt)
-            total_cost += total_amt_val + fee
-        elif t == 'SELL':
-            quantity -= abs(amt)
-            total_cost -= (total_amt_val - fee - stamp_tax)
-            if quantity <= 0:
-                quantity = 0
-                total_cost = 0.0   # 清仓截断
-        elif t == 'SPLIT':
-            quantity += abs(amt)   # total_cost unchanged
-        elif t == 'RIGHTS':
-            quantity += abs(amt)
-            total_cost += total_amt_val + fee + stamp_tax
-        elif t == 'DIVIDEND':
-            # Only reduce cost when currently holding (mirrors create_transaction logic)
-            if quantity > 0:
-                total_cost -= total_amt_val
-        elif t == 'DIVIDEND_TAX':
-            # Only increase cost when currently holding (mirrors create_transaction logic)
-            if quantity > 0:
-                total_cost += total_amt_val
+    quantity, total_cost, _ = _replay_position(txns)
 
     quantity = max(0, quantity)
     cost_price = round(total_cost / quantity, 4) if quantity > 0 else 0.0
@@ -500,7 +625,9 @@ def delete_transaction(transaction_id: int):
     """Delete a transaction (with cash balance reversal)"""
     with get_db() as conn:
         c = conn.cursor()
-        
+        # 先取写锁再读：完整性判断、删除与现金冲销处于同一事务，并发删除只生效一次
+        conn.execute('BEGIN IMMEDIATE')
+
         c.execute('SELECT * FROM transactions WHERE id = ?', (transaction_id,))
         row = c.fetchone()
         
@@ -522,6 +649,9 @@ def delete_transaction(transaction_id: int):
             reverse_cash = -total_amt
         elif trans_type == 'DIVIDEND_TAX':
             reverse_cash = total_amt  # 还原被扣的现金
+        elif trans_type == 'RIGHTS':
+            # 与 create_transaction 对称：配股创建时扣 total_amt + fee + stamp_tax
+            reverse_cash = total_amt + (fee or 0) + (stamp_tax or 0)
 
         ts_code = row["ts_code"]
 
@@ -530,6 +660,9 @@ def delete_transaction(transaction_id: int):
                   (account_id, ts_code))
         pb_row = c.fetchone()
         existing_buy_pb = pb_row['buy_pb'] if pb_row and pb_row['buy_pb'] is not None else 0.0
+
+        # 删除前判断历史是否完整：不完整时重算会覆盖快照持仓基线，只冲销现金
+        incomplete_reason = _history_incomplete_reason(c, account_id, ts_code)
 
         c.execute('DELETE FROM transactions WHERE id = ?', (transaction_id,))
 
@@ -540,11 +673,23 @@ def delete_transaction(transaction_id: int):
             c.execute('UPDATE accounts SET cash_balance = cash_balance + ? WHERE id = ?',
                      (reverse_cash, account_id))
 
+        if incomplete_reason:
+            conn.commit()
+            return {
+                "status": "success",
+                "message": "Transaction deleted",
+                "cash_reversed": round(reverse_cash, 2),
+                "holdings_rebuilt": False,
+                "warning": (f"交易已删除、资金已冲销，但该股票{incomplete_reason}。"
+                            f"为避免覆盖，持仓未自动重算，请手工核对持仓数量和成本。"),
+            }
+
         # Rebuild holdings from remaining transactions (correct for any historical deletion)
         _rebuild_single_stock_holdings(conn, account_id, ts_code, fallback_buy_pb=existing_buy_pb)
 
         conn.commit()
-        return {"status": "success", "message": "Transaction deleted", "cash_reversed": round(reverse_cash, 2)}
+        return {"status": "success", "message": "Transaction deleted",
+                "cash_reversed": round(reverse_cash, 2), "holdings_rebuilt": True}
 
 # --- Holdings Rebuild API ---
 

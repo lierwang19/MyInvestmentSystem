@@ -10,7 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 logger = logging.getLogger("scheduler")
 logger.setLevel(logging.INFO)
 
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH, USER_DB_PATH
 from web.backend.time_utils import sh_date_str, sh_now, sh_today
 
 # Last run status for each job (cleared on restart)
@@ -25,6 +25,14 @@ _market_update_done = threading.Event()
 _market_update_done.set()
 _valuation_done = threading.Event()
 _valuation_done.set()
+_factor_done = threading.Event()
+_factor_done.set()
+_scoring_done = threading.Event()
+_scoring_done.set()
+
+# 子进程超时上限（秒）：外部数据源卡住时强制终止，避免长期占用写锁
+MARKET_UPDATE_TIMEOUT_SEC = 10800
+FACTOR_BUILD_TIMEOUT_SEC = 3600
 
 # Default schedule config
 DEFAULT_SCHEDULES = {
@@ -94,6 +102,45 @@ def _scheduler_hm() -> str:
 
 def _scheduler_day_key() -> str:
     return sh_now().strftime("%Y%m%d")
+
+
+def _upstream_ok_today(job_id: str) -> bool:
+    """上游任务今日是否成功。W9 熔断：misfire 补跑窗口内（如休眠唤醒），
+    上游任务可能因超出 grace 被跳过（SCHEDULER_LAST_RUN 停留在昨日 ok），
+    此时下游必须跳过，不能基于旧数据计算。要求 status=ok 且日期为今日；
+    进程重启导致无记录时同样熔断（保守跳过，可手动触发）。"""
+    entry = SCHEDULER_LAST_RUN.get(job_id, {})
+    return entry.get("status") == "ok" and entry.get("date") == _scheduler_day_key()
+
+
+def _complete_job(event):
+    """Release dependent jobs on every exit, including early skip and failure."""
+    from functools import wraps
+
+    def decorate(func):
+        @wraps(func)
+        def run(*args, **kwargs):
+            event.clear()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                event.set()
+        return run
+    return decorate
+
+
+def _wait_for_upstream(job_id, event, dependent):
+    if event.wait(timeout=40 * 60) and _upstream_ok_today(job_id):
+        return True
+    SCHEDULER_LAST_RUN[dependent] = {
+        "time": _scheduler_hm(),
+        "date": _scheduler_day_key(),
+        "status": "skipped",
+        "reason": "upstream_not_fresh",
+        "detail": f"上游 {job_id} 今日未成功或等待超时，已跳过",
+    }
+    logger.warning("%s: %s", dependent, SCHEDULER_LAST_RUN[dependent]["detail"])
+    return False
 
 
 # ─── Calibrator helpers ────────────────────────────────────────────────────────
@@ -265,7 +312,7 @@ def run_daily_market_update():
 
     script_path = os.path.join(PROJECT_ROOT, "scripts", "etl", "get_market_data_db_robust.py")
     log_file = os.path.join(PROJECT_ROOT, "logs", f"scheduler_daily_{_scheduler_day_key()}.log")
-    market_db = os.path.join(PROJECT_ROOT, "market.db")
+    market_db = MARKET_DB_PATH
     base_csv = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
 
     # Ensure logs dir exists
@@ -282,6 +329,7 @@ def run_daily_market_update():
             logger.info(f"market_update calibrator: {fill_msg}")
             SCHEDULER_LAST_RUN["market_update"] = {
                 "time": _scheduler_hm(),
+                "date": _scheduler_day_key(),
                 "status": "ok",
                 "detail": f"drip已覆盖，跳过",
             }
@@ -312,12 +360,21 @@ def run_daily_market_update():
             ]
 
         with open(log_file, "w", encoding="utf-8") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True, cwd=PROJECT_ROOT)
+            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True, cwd=PROJECT_ROOT,
+                           timeout=MARKET_UPDATE_TIMEOUT_SEC)
         logger.info("Daily Market Data Update Completed Successfully.")
         SCHEDULER_LAST_RUN["market_update"] = {
             "time": _scheduler_hm(),
+            "date": _scheduler_day_key(),
             "status": "ok",
             "detail": fill_msg if (ok_fill and fill_base) else "全量完成",
+        }
+    except subprocess.TimeoutExpired:
+        logger.error(f"Daily Market Data Update Timeout (> {MARKET_UPDATE_TIMEOUT_SEC}s).")
+        SCHEDULER_LAST_RUN["market_update"] = {
+            "time": _scheduler_hm(),
+            "status": "error",
+            "detail": f"market_update 子进程超时（> {MARKET_UPDATE_TIMEOUT_SEC} 秒），已终止",
         }
     except subprocess.CalledProcessError as e:
         logger.error(f"Daily Market Data Update Failed: {e}")
@@ -377,6 +434,7 @@ def run_monthly_market_sync():
     except Exception as e:
         logger.error(f"Monthly Market Data Sync Exception: {e}")
 
+@_complete_job(_factor_done)
 def run_factor_build():
     """Run make_market_enriched_from_db.py to rebuild PB/PE factors and market_enriched.csv"""
     from web.backend.services.trading_calendar import is_a_trading_day
@@ -409,26 +467,16 @@ def run_factor_build():
         return
 
     # 上游失败时跳过，避免用残缺 daily_valuation 生成 market_enriched.csv
-    # 白名单放行（其余一律阻断）：
-    #   ok                           → 估值补全成功
-    #   skipped + no_missing         → drip 已全覆盖，估值校准正常跳过
-    #   None（进程重启，无记录）       → 保守放行，避免阻断正常启动后首次运行
-    # 阻断：
-    #   error                        → 估值 ETL 脚本报错
-    #   skipped + upstream_failed    → 上游行情入库失败/超时
-    #   skipped + lock_timeout       → 写锁等待超时
-    #   skipped + no_target_date     → market.db 无目标交易日（首次部署 / 数据异常）
-    val_entry = SCHEDULER_LAST_RUN.get("valuation_build", {})
-    valuation_status = val_entry.get("status")
-    valuation_reason = val_entry.get("reason")
-    ALLOWED = {
-        ("ok", None),   # 估值补全成功，或 drip 已全覆盖正常跳过
-        (None, None),   # 进程重启无记录，保守放行
-    }
-    blocked = (valuation_status, valuation_reason) not in ALLOWED
-    if blocked:
+    # W9: 要求估值构建今日成功（含 drip 已覆盖的 ok），否则跳过。
+    # 旧逻辑中 (None, None) 保守放行会在休眠补跑 / 进程重启后基于旧数据计算，
+    # 现改为按日期熔断；需要时可手动触发。
+    if not _upstream_ok_today("valuation_build"):
+        val_entry = SCHEDULER_LAST_RUN.get("valuation_build", {})
+        valuation_status = val_entry.get("status")
+        valuation_reason = val_entry.get("reason")
         logger.warning(
-            f"Factor Build: valuation_build status={valuation_status!r} reason={valuation_reason!r}，跳过本次 enriched 重算"
+            f"Factor Build: valuation_build 今日未成功 "
+            f"(status={valuation_status!r} reason={valuation_reason!r})，跳过本次 enriched 重算"
         )
         SCHEDULER_LAST_RUN["factor_build"] = {
             "time": _scheduler_hm(),
@@ -446,7 +494,7 @@ def run_factor_build():
         sys.executable,
         script_path,
         "--base", os.path.join(PROJECT_ROOT, "stock_industry_base.csv"),
-        "--db", os.path.join(PROJECT_ROOT, "market.db"),
+        "--db", MARKET_DB_PATH,
         "--out", os.path.join(PROJECT_ROOT, "market_enriched.csv"),
         "--n-low-days", "252",
         "--use-tushare", "0",  # 不依赖 Tushare，用 DB 内数据
@@ -454,12 +502,21 @@ def run_factor_build():
 
     try:
         with open(log_file, "w", encoding="utf-8") as f:
-            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True, cwd=PROJECT_ROOT)
+            subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, check=True, cwd=PROJECT_ROOT,
+                           timeout=FACTOR_BUILD_TIMEOUT_SEC)
         logger.info("Factor Build Completed Successfully.")
         SCHEDULER_LAST_RUN["factor_build"] = {
             "time": _scheduler_hm(),
+            "date": _scheduler_day_key(),
             "status": "ok",
             "detail": "完成",
+        }
+    except subprocess.TimeoutExpired:
+        logger.error(f"Factor Build Timeout (> {FACTOR_BUILD_TIMEOUT_SEC}s).")
+        SCHEDULER_LAST_RUN["factor_build"] = {
+            "time": _scheduler_hm(),
+            "status": "error",
+            "detail": f"factor_build 子进程超时（> {FACTOR_BUILD_TIMEOUT_SEC} 秒），已终止",
         }
     except subprocess.CalledProcessError as e:
         logger.error(f"Factor Build Failed: {e}")
@@ -477,9 +534,10 @@ def run_factor_build():
         }
 
 
+@_complete_job(_valuation_done)
 def run_valuation_build():
     """校准器：补全 daily_valuation 真实缺口（build_fundamentals_and_valuation.py）"""
-    # 节假日 skip 必须在 _valuation_done.clear() 之前，避免 factor_build 因 Event 被清空而阻塞
+    # 完成事件由装饰器统一管理，节假日及其他提前返回也会释放等待者。
     from web.backend.services.trading_calendar import is_a_trading_day
     if not is_a_trading_day():
         logger.info("valuation_build: 今日非交易日，跳过")
@@ -492,9 +550,6 @@ def run_valuation_build():
         return
 
     logger.info("Starting Valuation Build calibrator (strict daily_valuation coverage)...")
-
-    # [Race Fix] 先占用 _valuation_done，再等上游，避免 factor_build 在等待窗口内误判 Event 已 set
-    _valuation_done.clear()
 
     # 立即写 running 状态（在等待上游期间也应显示为 running，让前端卡片反映真实链路状态）
     SCHEDULER_LAST_RUN["valuation_build"] = {
@@ -514,15 +569,17 @@ def run_valuation_build():
         }
         return
 
-    # 上游失败时跳过，避免基于旧/残缺行情计算估值
-    market_status = SCHEDULER_LAST_RUN.get("market_update", {}).get("status")
-    if market_status not in ("ok", None):
-        logger.warning(f"Valuation Build: market_update 状态为 {market_status!r}，跳过本次估值构建")
+    # 上游失败或非今日成功时跳过，避免基于旧/残缺行情计算估值。
+    # W9: misfire 补跑时上游可能因超 grace 被跳过（状态停留昨日 ok），
+    # 必须按日期熔断；进程重启无记录时同样跳过（可手动触发）。
+    if not _upstream_ok_today("market_update"):
+        market_status = SCHEDULER_LAST_RUN.get("market_update", {}).get("status")
+        logger.warning(f"Valuation Build: market_update 今日未成功（{market_status!r}），跳过本次估值构建")
         SCHEDULER_LAST_RUN["valuation_build"] = {
             "time": _scheduler_hm(),
             "status": "skipped",
-            "reason": "upstream_failed",
-            "detail": f"上游行情入库 {market_status}，已跳过",
+            "reason": "upstream_not_fresh",
+            "detail": f"上游行情入库今日未成功（{market_status}），已跳过",
         }
         return
 
@@ -546,12 +603,11 @@ def run_valuation_build():
             "reason": "lock_timeout",
             "detail": "等待 drip 写锁超时（15 min），已跳过",
         }
-        _valuation_done.set()
         return
 
     script_path = os.path.join(PROJECT_ROOT, "scripts", "etl", "build_fundamentals_and_valuation.py")
     log_file = os.path.join(PROJECT_ROOT, "logs", f"scheduler_valuation_{_scheduler_day_key()}.log")
-    market_db = os.path.join(PROJECT_ROOT, "market.db")
+    market_db = MARKET_DB_PATH
     base_csv = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     import tempfile
@@ -576,6 +632,7 @@ def run_valuation_build():
             logger.info(f"Valuation Build: {target_date} 估值全覆盖，跳过")
             SCHEDULER_LAST_RUN["valuation_build"] = {
                 "time": _scheduler_hm(),
+                "date": _scheduler_day_key(),
                 "status": "ok",
                 "detail": f"drip已覆盖 {target_date}，跳过",
             }
@@ -614,6 +671,7 @@ def run_valuation_build():
             logger.info(f"Valuation Build Completed ({len(ts_codes)} stocks missing for {target_date}).")
             SCHEDULER_LAST_RUN["valuation_build"] = {
                 "time": _scheduler_hm(),
+                "date": _scheduler_day_key(),
                 "status": "ok",
                 "detail": f"补全 {len(ts_codes)} 只（{target_date}）",
             }
@@ -645,8 +703,6 @@ def run_valuation_build():
                 market_db_write_lock.release()
         except Exception:
             pass
-        # [P0] 无论成功/失败/异常，都释放 Event，让 factor_build 可以继续
-        _valuation_done.set()
         if os.path.exists(tmp_out):
             try:
                 os.remove(tmp_out)
@@ -654,6 +710,7 @@ def run_valuation_build():
                 pass
 
 
+@_complete_job(_scoring_done)
 def run_daily_scoring():
     """Run scoring to refresh the stock pool after market data update"""
     from web.backend.services.trading_calendar import is_a_trading_day
@@ -667,7 +724,14 @@ def run_daily_scoring():
         }
         return
 
+    if not _wait_for_upstream("factor_build", _factor_done, "scoring"):
+        return
+
     logger.info("Starting Daily Scoring...")
+    SCHEDULER_LAST_RUN["scoring"] = {
+        "time": _scheduler_hm(), "date": _scheduler_day_key(),
+        "status": "running", "detail": "运行中",
+    }
     
     try:
         import scoring
@@ -675,13 +739,21 @@ def run_daily_scoring():
             config_path=os.path.join(PROJECT_ROOT, "config", "scoring.yaml"),
             base_path=os.path.join(PROJECT_ROOT, "stock_industry_base.csv"),
             enriched_path=os.path.join(PROJECT_ROOT, "market_enriched.csv"),
-            user_db_path=os.path.join(PROJECT_ROOT, "user_data.db"),
+            user_db_path=USER_DB_PATH,
             min_score=70,
             write_csv=False,
         )
         logger.info(f"Daily Scoring Completed: {result.get('pool_count', 0)} stocks in pool")
+        SCHEDULER_LAST_RUN["scoring"] = {
+            "time": _scheduler_hm(), "date": _scheduler_day_key(),
+            "status": "ok", "detail": f"完成，{result.get('pool_count', 0)} 只候选",
+        }
     except Exception as e:
         logger.error(f"Daily Scoring Error: {e}")
+        SCHEDULER_LAST_RUN["scoring"] = {
+            "time": _scheduler_hm(), "date": _scheduler_day_key(),
+            "status": "error", "detail": str(e),
+        }
 
 def run_daily_strategy():
     """Run strategy engine for all accounts to generate signals and decisions after scoring"""
@@ -698,6 +770,9 @@ def run_daily_strategy():
         return
 
     logger.info("Starting Daily Strategy Run...")
+    # HK-only trading days intentionally use the most recent A-share scoring.
+    if is_a_trading_day() and not _wait_for_upstream("scoring", _scoring_done, "strategy_run"):
+        return
     try:
         import engine as strategy_engine
         from web.backend.database import get_db
@@ -741,6 +816,8 @@ def run_daily_asset_snapshot():
         return
 
     logger.info("Starting Daily Asset Snapshot...")
+    if is_a_trading_day() and not _wait_for_upstream("market_update", _market_update_done, "asset_snapshot"):
+        return
     try:
         from web.backend.api.assets import snapshot_assets
         result = snapshot_assets(account_id="all")
@@ -934,7 +1011,11 @@ def apply_schedule(scheduler=None, tz=None):
                 CronTrigger(**trigger_kwargs),
                 id=job_id,
                 name=cfg.get("name", job_id),
-                replace_existing=True
+                replace_existing=True,
+                # 防堆积：机器休眠/任务超时后不补跑过期任务，同类任务不重叠执行
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=3600,
             )
             logger.info(f"Scheduled '{cfg.get('name', job_id)}' at {cfg['hour']:02d}:{cfg['minute']:02d} ({tz})")
         else:
@@ -967,6 +1048,7 @@ def start_scheduler():
             name="持续补数（切片滴灌）",
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=600,
             replace_existing=True,
         )
         logger.info(f"Drip sync job registered (every {interval_min} min)")

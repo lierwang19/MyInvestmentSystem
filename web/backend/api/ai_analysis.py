@@ -1,26 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-AI Risk Analysis API — streams Ollama LLM analysis for individual stocks.
-Data sources: SQLite DBs + akshare news + local Ollama (gemma4:e4b).
+AI Risk Analysis API — streams LLM analysis for individual stocks.
+Data sources: SQLite DBs + akshare news + workstation sglang (qwen).
 """
-import os
-import json
 import logging
-import urllib.request
-import urllib.error
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from web.backend.config import USER_DB_PATH, MARKET_DB_PATH
 from web.backend.database import get_db, get_market_db
+from web.backend.services import sglang_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "localhost")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gemma4:e4b")
-OLLAMA_BASE = f"http://{OLLAMA_HOST}:11434"
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -35,15 +28,6 @@ def _fmt(val, fmt=".2f", fallback="—"):
         return format(float(val), fmt) if val is not None else fallback
     except (TypeError, ValueError):
         return fallback
-
-
-def _check_ollama() -> bool:
-    """Return True if Ollama is reachable."""
-    try:
-        urllib.request.urlopen(f"{OLLAMA_BASE}/api/tags", timeout=5)
-        return True
-    except Exception:
-        return False
 
 
 # ── data fetching ─────────────────────────────────────────────────────────────
@@ -191,40 +175,24 @@ def _build_prompt(ts_code: str, name: str, data: dict, news_titles: list[str]) -
 
 # ── streaming generator ───────────────────────────────────────────────────────
 
-def _stream_ollama(prompt: str):
-    """Async generator: yield SSE data lines from Ollama streaming response."""
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": True,
-        "options": {"temperature": 0.3, "num_predict": -1, "num_ctx": 8192},
-    }).encode("utf-8")
+def _sse_data(text: str) -> str:
+    """Encode text as one SSE event; embedded newlines become multiple data lines."""
+    return "".join(f"data: {part}\n" for part in text.split("\n")) + "\n"
 
-    req = urllib.request.Request(
-        f"{OLLAMA_BASE}/api/generate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
 
+def _stream_llm(prompt: str):
+    """Generator: yield SSE events from sglang streaming response."""
+    has_output = False
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            for line in resp:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                token = chunk.get("response", "")
-                if token:
-                    yield f"data: {token}\n\n"
-                if chunk.get("done"):
-                    yield "event: done\ndata: \n\n"
-                    return
+        for token in sglang_client.chat_stream(prompt, timeout=180):
+            has_output = True
+            yield _sse_data(token)
+        yield "event: done\ndata: \n\n"
     except Exception as e:
-        logger.exception("Ollama 流式调用失败")
-        yield f"event: error\ndata: LLM调用异常: {e}\n\n"
+        logger.exception("sglang 流式调用失败")
+        # 保留已输出的部分内容，错误提示另起一段
+        prefix = "\n\n" if has_output else ""
+        yield "event: error\n" + _sse_data(f"{prefix}LLM调用异常: {e}")
 
 
 # ── endpoint ──────────────────────────────────────────────────────────────────
@@ -234,7 +202,7 @@ def analyze_stock(ts_code: str, name: str = ""):
     """
     Stream AI risk analysis for a stock.
     Phase 1 (sync): validate data + fetch news
-    Phase 2 (stream): call Ollama and SSE-stream tokens
+    Phase 2 (stream): call sglang and SSE-stream tokens
     """
     if not ts_code:
         raise HTTPException(status_code=400, detail="ts_code 不能为空")
@@ -249,11 +217,11 @@ def analyze_stock(ts_code: str, name: str = ""):
     plain_code = to_plain_code(ts_code)
     news_titles = _fetch_news(plain_code)
 
-    # Phase 1c: check Ollama
-    if not _check_ollama():
+    # Phase 1c: check sglang
+    if not sglang_client.check_sglang():
         raise HTTPException(
             status_code=503,
-            detail=f"AI 服务未就绪，请确认 Ollama 已启动（{OLLAMA_BASE}）",
+            detail=f"AI 服务未就绪：{sglang_client.unreachable_msg()}",
         )
 
     # Phase 2: build prompt + stream
@@ -261,7 +229,7 @@ def analyze_stock(ts_code: str, name: str = ""):
     prompt = _build_prompt(ts_code, display_name, data, news_titles)
 
     return StreamingResponse(
-        _stream_ollama(prompt),
+        _stream_llm(prompt),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

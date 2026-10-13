@@ -109,6 +109,13 @@ async def upload_file(file_type: str, file: UploadFile = File(...), account_id: 
             migrated_count = migrate_holdings_to_db(save_path, account_id)
         except Exception as e:
             logger.warning(f"Warning: Holdings migration failed: {e}")
+            return {
+                "status": "warning",
+                "message": f"持仓导入失败，原持仓未改动：{e}",
+                "filename": save_name,
+                "path": save_path,
+                "migrated_to_db": 0
+            }
 
     return {
         "status": "success",
@@ -150,44 +157,46 @@ def migrate_holdings_to_db(file_path: str, account_id: str) -> int:
     if not code_col or not qty_col:
         raise ValueError(f"Cannot find required columns. Available: {cols.tolist()}")
     
+    import math
+
+    # 先解析并校验全部行；任何一行出错都不动数据库中的原持仓
+    parsed = []
+    errors = []
+    for idx, row in df.iterrows():
+        try:
+            ts_code = normalize_code(row[code_col])
+            name = row[name_col] if name_col else ""
+            quantity_f = float(row[qty_col]) if pd.notna(row[qty_col]) else 0.0
+            cost = float(row[cost_col]) if cost_col and pd.notna(row.get(cost_col)) else 0.0
+            if not math.isfinite(quantity_f) or not math.isfinite(cost):
+                raise ValueError("数量或成本价不是有限数值")
+            quantity = int(quantity_f)
+            if quantity <= 0:
+                continue
+            if any(p[0] == ts_code for p in parsed):
+                raise ValueError(f"证券代码 {ts_code} 重复")
+            parsed.append((ts_code, name, quantity, cost))
+        except Exception as e:
+            errors.append(f"第 {idx + 2} 行: {e}")
+
+    if errors:
+        raise ValueError(f"持仓文件有 {len(errors)} 行无法解析，未做任何修改：" + "；".join(errors[:5]))
+
     from web.backend.database import get_db
-    
+
     with get_db() as conn:
         c = conn.cursor()
-        
-        # Clear existing holdings for this account (fresh import)
+        now_ts = sh_timestamp_str()
+        # 校验通过后在同一事务内整体替换（fresh import）
         c.execute('DELETE FROM holdings WHERE account_id = ?', (account_id,))
-        
-        migrated = 0
-        failed = 0
-        for _, row in df.iterrows():
-            try:
-                ts_code = normalize_code(row[code_col])
-                name = row[name_col] if name_col else ""
-                quantity = int(float(row[qty_col])) if pd.notna(row[qty_col]) else 0
-                cost = float(row[cost_col]) if cost_col and pd.notna(row.get(cost_col)) else 0
-                
-                if quantity <= 0:
-                    continue
-                
-                total_cost = quantity * cost
-                now_ts = sh_timestamp_str()
-                
-                c.execute('''
-                    INSERT INTO holdings (account_id, ts_code, name, quantity, cost_price, total_cost, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (account_id, ts_code, name, quantity, round(cost, 4), round(total_cost, 2), now_ts, now_ts))
-                migrated += 1
-            except Exception as e:
-                logger.error(f"Error migrating row: {e}")
-                failed += 1
-                continue
-        
+        for ts_code, name, quantity, cost in parsed:
+            c.execute('''
+                INSERT INTO holdings (account_id, ts_code, name, quantity, cost_price, total_cost, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (account_id, ts_code, name, quantity, round(cost, 4), round(quantity * cost, 2), now_ts, now_ts))
         conn.commit()
+    migrated = len(parsed)
 
-    if failed and migrated == 0:
-        raise ValueError(f"Holdings migration failed for all {failed} rows")
-    
     logger.info(f"✅ Migrated {migrated} holdings to database for account {account_id}")
     return migrated
 

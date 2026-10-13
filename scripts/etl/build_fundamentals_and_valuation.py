@@ -41,7 +41,24 @@ except ModuleNotFoundError:
 
 # ===================== 默认配置（可被命令行覆盖） =====================
 DEFAULT_BASE_FILE   = "stock_industry_base.csv"
-DEFAULT_DB_PATH     = "market.db"
+def _default_db_path():
+    """data/market.db 优先；兼容项目根目录下的旧文件。"""
+    try:
+        from web.backend.config import resolve_db_path
+        return resolve_db_path("market.db")
+    except ImportError:
+        pass
+    # 独立运行、无法导入 web.backend 时：按脚本位置定位项目根目录，
+    # 用绝对路径并确保 data/ 存在，避免 CWD 相关的相对路径打不开库。
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    data_dir = os.path.join(root, "data")
+    new_path = os.path.join(data_dir, "market.db")
+    old_path = os.path.join(root, "market.db")
+    if os.path.exists(new_path) or not os.path.exists(old_path):
+        os.makedirs(data_dir, exist_ok=True)
+        return new_path
+    return old_path
+DEFAULT_DB_PATH     = _default_db_path()
 DEFAULT_OUT_FILE    = "market_enriched.csv"
 DEFAULT_BATCH       = 0
 DEFAULT_START_YEAR  = "2015"
@@ -459,14 +476,35 @@ def get_last_valuation_date(conn: sqlite3.Connection, ts_code: str) -> Optional[
     row = conn.execute("SELECT MAX(trade_date) FROM daily_valuation WHERE ts_code=?", (ts_code,)).fetchone()
     return row[0] if row and row[0] else None
 
+def statutory_disclosure_deadline(period_end) -> Optional[str]:
+    """A 股定期报告法定最晚披露日：一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30。"""
+    try:
+        pe = pd.to_datetime(period_end)
+    except Exception:
+        return None
+    if pd.isna(pe):
+        return None
+    deadlines = {3: (pe.year, 4, 30), 6: (pe.year, 8, 31), 9: (pe.year, 10, 31), 12: (pe.year + 1, 4, 30)}
+    if pe.month in deadlines:
+        y, m, d = deadlines[pe.month]
+        return f"{y:04d}-{m:02d}-{d:02d}"
+    # 非标准报告期：保守按 4 个月后视为已知
+    return (pe + pd.DateOffset(months=4)).strftime("%Y-%m-%d")
+
+
 def compute_daily_valuation_for_stock(conn: sqlite3.Connection, ts_code: str,
                                       since: Optional[str]=None, safety_days: int=DEFAULT_SAFETY_DAYS):
     """公告日口径对齐→向前填充→按每日 close 推导 pb/pe_ttm（支持增量）"""
     fi = pd.read_sql_query("""
-        SELECT period_end, COALESCE(announce_date, period_end) AS ad, bvps, eps_ttm
+        SELECT period_end, announce_date AS ad, bvps, eps_ttm
         FROM fin_indicators_q
-        WHERE ts_code=? ORDER BY ad ASC
+        WHERE ts_code=?
     """, conn, params=(ts_code,))
+    if fi.empty: return
+    # 公告日未知时不能用报告期末（会引入未来数据），改用法定披露截止日作为最早已知日
+    fi["ad"] = [a if pd.notna(a) and a else statutory_disclosure_deadline(p)
+                for a, p in zip(fi["ad"], fi["period_end"])]
+    fi = fi.dropna(subset=["ad"])
     if fi.empty: return
     px = pd.read_sql_query("""
         SELECT trade_date, close FROM daily_price

@@ -28,6 +28,14 @@ from typing import Optional
 
 import pandas as pd
 
+def _resolve_user_db(root):
+    """data/user_data.db 优先；兼容给定 root 下的旧位置。"""
+    new = os.path.join(root, "data", "user_data.db")
+    if os.path.exists(new):
+        return new
+    old = os.path.join(root, "user_data.db")
+    return old if os.path.exists(old) else new
+
 try:
     from web.backend.time_utils import sh_timestamp_str
 except ImportError:
@@ -265,7 +273,7 @@ def run_etl(
     if base_path is None:
         base_path = os.path.join(project_root, "stock_industry_base.csv")
     if user_db_path is None:
-        user_db_path = os.path.join(project_root, "user_data.db")
+        user_db_path = _resolve_user_db(project_root)
 
     # 读取基础表
     df = pd.read_csv(base_path, dtype=str)

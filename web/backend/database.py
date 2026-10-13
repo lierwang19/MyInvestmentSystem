@@ -2,6 +2,7 @@
 import sqlite3
 import os
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -21,20 +22,41 @@ from contextlib import contextmanager
 @contextmanager
 def get_db():
     """Context manager for safe DB access. Usage: `with get_db() as conn:`"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=DELETE")
+    # WAL: 定时任务/API/行情轮询并发写入时，避免 "database is locked"。
+    # user_data.db 现位于 data/ 目录（Docker 卷挂载），WAL 附属文件与主库同卷，安全。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
     finally:
         conn.close()
 
-from web.backend.config import PROJECT_ROOT
-MARKET_DB_PATH = os.path.join(PROJECT_ROOT, "market.db")
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH
 
 @contextmanager
 def get_market_db():
-    """Context manager for market.db access. Yields None if market.db doesn't exist."""
+    """Read-only context manager for market.db. Yields None if market.db doesn't exist.
+
+    业务 API 只读行情库；需要写入时使用 get_market_db_rw()。
+    WAL 由写入侧（ETL / get_market_db_rw）负责开启。
+    """
+    if not os.path.exists(MARKET_DB_PATH):
+        yield None
+        return
+    conn = sqlite3.connect(Path(MARKET_DB_PATH).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000") # wait up to 15s before raising lock error
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+@contextmanager
+def get_market_db_rw():
+    """Read-write context manager for market.db, only for legitimate writes. Yields None if missing."""
     if not os.path.exists(MARKET_DB_PATH):
         yield None
         return
@@ -47,7 +69,61 @@ def get_market_db():
     finally:
         conn.close()
 
+def pending_restore_path(db_path=None):
+    return str(db_path or DB_PATH) + ".restore-pending"
+
+
+def validate_user_db(path):
+    """Reject corrupt, empty, or unrelated SQLite files before accepting a restore."""
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        results = conn.execute("PRAGMA integrity_check").fetchall()
+        if results != [("ok",)]:
+            raise ValueError("备份数据库完整性检查失败")
+        required = {
+            "accounts": {"id", "name", "cash_balance"},
+            "brokers": {"id", "name"},
+            "holdings": {"account_id", "ts_code", "quantity", "cost_price"},
+            "transactions": {"account_id", "ts_code", "trans_type", "date"},
+            "system_settings": {"key", "value"},
+        }
+        for table, columns in required.items():
+            actual = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            if not columns <= actual:
+                raise ValueError(f"备份缺少必要的业务表或字段：{table}")
+    finally:
+        conn.close()
+
+
+def apply_pending_restore():
+    """Apply a validated snapshot at startup, before pollers and jobs start.
+
+    Keep the live file's inode and let SQLite update its pages and WAL. An
+    exclusive connection rejects an overlapping backend/ETL reader or writer;
+    on failure the pending snapshot is retained and startup fails closed.
+    """
+    pending = pending_restore_path()
+    if not os.path.isfile(pending):
+        return
+    validate_user_db(pending)
+    dst = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        dst.execute("PRAGMA locking_mode=EXCLUSIVE")
+        dst.execute("BEGIN EXCLUSIVE")
+        dst.rollback()  # exclusive locking mode retains the file lock
+        src = sqlite3.connect(Path(pending).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+    finally:
+        dst.close()
+    os.unlink(pending)
+    logger.info("已在启动阶段恢复用户数据库：%s", DB_PATH)
+
+
 def init_db():
+    apply_pending_restore()
     with get_db() as conn:
         _create_tables(conn)
 

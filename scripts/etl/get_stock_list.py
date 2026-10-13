@@ -27,7 +27,8 @@ def main():
     if args.sample and args.sample > 0:
         n = min(args.sample, len(df))
         df_s = df.sample(n=n, random_state=2025)[["ts_code"]].reset_index(drop=True)
-        out = f"ts_sample_{n}.csv"
+        Path("data").mkdir(parents=True, exist_ok=True)
+        out = f"data/ts_sample_{n}.csv"
         df_s.to_csv(out, index=False, encoding="utf-8-sig")
         print(f"✅ 抽样清单：{out}（{n} 条）")
 

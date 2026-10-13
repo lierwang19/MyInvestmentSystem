@@ -12,7 +12,7 @@ import subprocess
 import logging
 from copy import deepcopy
 
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH, USER_DB_PATH
 from web.backend.database import get_db
 from web.backend.utils import dict_factory
 
@@ -42,10 +42,19 @@ def _safe_mtime(path: str):
         return None
 
 
+def _db_cache_mtime(path: str):
+    """数据库缓存键用的时间戳。
+
+    WAL 模式下事务提交可能只追加 -wal，主库文件 mtime 不变；
+    把 -wal/-shm 的 mtime 一并取最大，避免缓存长期不失效。
+    """
+    return max((_safe_mtime(p) or 0) for p in (path, path + "-wal", path + "-shm"))
+
+
 def _get_stock_pool_cache_key():
     return (
-        _safe_mtime(os.path.join(PROJECT_ROOT, "user_data.db")),
-        _safe_mtime(os.path.join(PROJECT_ROOT, "market.db")),
+        _db_cache_mtime(USER_DB_PATH),
+        _db_cache_mtime(MARKET_DB_PATH),
         _safe_mtime(os.path.join(PROJECT_ROOT, "config", "scoring.yaml")),
         _safe_mtime(os.path.join(PROJECT_ROOT, "stock_industry_base.csv")),
     )
@@ -58,7 +67,7 @@ def _rebuild_enriched_csv(base_path: str, enriched_path: str):
     先输出到临时文件，成功后原子替换，避免半写入。
     """
     script  = os.path.join(PROJECT_ROOT, "scripts", "etl", "make_market_enriched_from_db.py")
-    db_path = os.path.join(PROJECT_ROOT, "market.db")
+    db_path = MARKET_DB_PATH
 
     if not os.path.isfile(db_path):
         raise HTTPException(status_code=400, detail="market.db 不存在，无法生成 market_enriched.csv")
@@ -307,7 +316,7 @@ def scan_stock_pool():
         config_path   = os.path.join(PROJECT_ROOT, "config", "scoring.yaml")
         base_path     = os.path.join(PROJECT_ROOT, "stock_industry_base.csv")
         enriched_path = os.path.join(PROJECT_ROOT, "market_enriched.csv")
-        user_db_path  = os.path.join(PROJECT_ROOT, "user_data.db")
+        user_db_path  = USER_DB_PATH
 
         if not os.path.isfile(base_path):
             raise HTTPException(status_code=400, detail="stock_industry_base.csv not found.")

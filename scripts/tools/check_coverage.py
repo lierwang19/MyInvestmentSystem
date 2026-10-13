@@ -49,7 +49,8 @@ def _get_ts_pro():
     return ts.pro_api()
 
 
-LOG_DIR = Path("./")
+LOG_DIR = Path("./data")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------------------------------------------------------------
 
 def connect_db(db_path: str) -> sqlite3.Connection:

@@ -14,6 +14,7 @@ score_universe.py
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -32,6 +33,12 @@ def resolve_path(base_dir: Path, p: str) -> Path:
     if not path.is_absolute():
         path = (base_dir / p).resolve()
     return path
+
+
+def _valid_score(x) -> bool:
+    """分项分数是否可参与加权：None / NaN / Inf 均视为缺失。"""
+    v = to_float(x)
+    return v is not None and math.isfinite(v)
 
 
 def to_float(x) -> Optional[float]:
@@ -271,11 +278,11 @@ def main():
     total_scores: List[Optional[float]] = []
     for _, row in df.iterrows():
         parts = []
-        if row["pb_score"] is not None:
+        if _valid_score(row["pb_score"]):
             parts.append(("pb", w_pb, row["pb_score"]))
-        if row["pe_score"] is not None:
+        if _valid_score(row["pe_score"]):
             parts.append(("pe_ttm", w_pe, row["pe_score"]))
-        if row["dist_score"] is not None:
+        if _valid_score(row["dist_score"]):
             parts.append(("distance_from_1y_low", w_dist, row["dist_score"]))
 
         if not parts:

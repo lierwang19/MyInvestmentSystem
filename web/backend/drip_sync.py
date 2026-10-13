@@ -18,7 +18,7 @@ from typing import Optional
 
 logger = logging.getLogger("drip_sync")
 
-from web.backend.config import PROJECT_ROOT
+from web.backend.config import PROJECT_ROOT, MARKET_DB_PATH
 from web.backend.time_utils import sh_compact_timestamp, sh_date_str, sh_now, sh_timestamp_str
 
 # ─── 全局写锁（drip / scheduler / 手动 ETL 三者互斥） ───────────────────────
@@ -659,7 +659,7 @@ def _run_price_etl(temp_base: str, log_dir: str) -> Optional[int]:
     script_path = os.path.join(
         PROJECT_ROOT, "scripts", "etl", "get_market_data_db_robust.py"
     )
-    db_path = os.path.join(PROJECT_ROOT, "market.db")
+    db_path = MARKET_DB_PATH
     tmp_out = os.path.join(
         tempfile.gettempdir(), f"drip_price_out_{os.getpid()}.csv"
     )
@@ -706,7 +706,7 @@ def _run_val_etl(
     script_path = os.path.join(
         PROJECT_ROOT, "scripts", "etl", "build_fundamentals_and_valuation.py"
     )
-    db_path = os.path.join(PROJECT_ROOT, "market.db")
+    db_path = MARKET_DB_PATH
 
     cmd = [
         sys.executable, script_path,
